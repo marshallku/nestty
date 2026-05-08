@@ -1,4 +1,5 @@
 import AppKit
+import SwiftTerm
 @preconcurrency import WebKit
 
 @MainActor
@@ -27,6 +28,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// the latest snapshot via `self`.
     private var keybindings: [Keybindings.Binding] = []
     private var keybindingMonitor: Any?
+    /// Bridges Cmd/Option + Backspace/Delete to readline control bytes — see
+    /// `installEditKeyMonitor()` for why this can't be done inside SwiftTerm.
+    private var editKeyMonitor: Any?
 
     func applicationDidFinishLaunching(_: Notification) {
         // PR 1 (Tier 2.1) FFI smoke test. Proves the Rust staticlib linked
@@ -109,6 +113,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // local monitors). Hot-reload calls `applyKeybindings` to swap.
         applyKeybindings(config.keybindings)
         installKeybindingMonitor()
+        installEditKeyMonitor()
 
         setupMenuBar()
 
@@ -489,6 +494,48 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return nil
             }
             return event
+        }
+    }
+
+    /// SwiftTerm's `MacTerminalView.doCommand(by:)` only handles a subset of
+    /// macOS standard text-edit selectors (deleteBackward:, moveUp:, …).
+    /// Cmd+Backspace, Option+Backspace, Cmd+Delete and friends emit selectors
+    /// it routes to the default branch ("Unhandle selector …" print), so they
+    /// silently no-op. `keyDown` and `doCommand` on `MacTerminalView` are
+    /// `public` (not `open`), so we can't override them from this module.
+    /// Intercept the NSEvent before SwiftTerm sees it and send the readline-
+    /// equivalent control bytes directly. Mirrors Terminal.app / iTerm2:
+    ///
+    ///   Cmd+Backspace    → ^U   (kill to start of line)
+    ///   Option+Backspace → ^W   (kill word backward)
+    ///   Cmd+Delete       → ^K   (kill to end of line)
+    ///   Option+Delete    → ESC d (kill word forward)
+    private func installEditKeyMonitor() {
+        editKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
+            guard
+                let chars = event.charactersIgnoringModifiers,
+                let scalar = chars.unicodeScalars.first
+            else { return event }
+            // Backspace key reports U+007F; Forward Delete reports
+            // NSDeleteFunctionKey (0xF728).
+            let backspace: UInt32 = 0x7F
+            let forwardDelete: UInt32 = 0xF728
+
+            // Only act when a SwiftTerm view is the first responder; otherwise
+            // pass the event through (Find bar, etc. need their own keys).
+            guard let view = NSApp.keyWindow?.firstResponder as? LocalProcessTerminalView else {
+                return event
+            }
+
+            switch (mods, scalar.value) {
+            case ([.command], backspace): view.send([0x15])
+            case ([.option], backspace): view.send([0x17])
+            case ([.command], forwardDelete): view.send([0x0B])
+            case ([.option], forwardDelete): view.send([0x1B, 0x64])
+            default: return event
+            }
+            return nil
         }
     }
 
