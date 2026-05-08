@@ -1,0 +1,8 @@
+// SwiftPM picks this up automatically when a target named `CNesttyFFI` lives
+// at Sources/CNesttyFFI/. The Swift side does `import CNesttyFFI` and gets every
+// symbol declared in nestty_ffi.h. The actual implementation comes from
+// libnestty_ffi.a, which the Nestty executable target links via -L / -l flags.
+module CNesttyFFI {
+    header "nestty_ffi.h"
+    export *
+}

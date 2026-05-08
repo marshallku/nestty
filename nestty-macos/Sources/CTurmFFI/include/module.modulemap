@@ -1,8 +1,0 @@
-// SwiftPM picks this up automatically when a target named `CTurmFFI` lives
-// at Sources/CTurmFFI/. The Swift side does `import CTurmFFI` and gets every
-// symbol declared in turm_ffi.h. The actual implementation comes from
-// libturm_ffi.a, which the Turm executable target links via -L / -l flags.
-module CTurmFFI {
-    header "turm_ffi.h"
-    export *
-}

@@ -2,7 +2,7 @@ target/
 .DS_Store
 *.swp
 *.swo
-turm-macos/.build/
-turm-macos/DerivedData/
-turm-macos/*.xcodeproj/xcuserdata/
-turm-macos/*.xcworkspace/xcuserdata/
+nestty-macos/.build/
+nestty-macos/DerivedData/
+nestty-macos/*.xcodeproj/xcuserdata/
+nestty-macos/*.xcworkspace/xcuserdata/

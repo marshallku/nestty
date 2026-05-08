@@ -242,6 +242,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             shellMenu.addItem(item)
         }
 
+        // Edit menu — Cmd+C/V/A route through NSResponder chain (target=nil)
+        // to SwiftTerm's @objc open copy:/paste:/selectAll: in MacTerminalView.
+        // Without this menu, those keyEquivalents never get dispatched and the
+        // first responder never sees them, so clipboard appears dead.
+        let editItem = NSMenuItem()
+        mainMenu.addItem(editItem)
+        let editMenu = NSMenu(title: "Edit")
+        editItem.submenu = editMenu
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSResponder.selectAll(_:)), keyEquivalent: "a")
+
         // Find menu
         let findItem = NSMenuItem()
         mainMenu.addItem(findItem)
