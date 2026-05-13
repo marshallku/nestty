@@ -201,6 +201,14 @@ impl GuiRegistry {
         shutdown_handle: Option<UnixStream>,
     ) -> (String, bool) {
         let client_id = uuid::Uuid::new_v4().to_string();
+        // Snapshot for logging before `capabilities` moves into the client.
+        // Re-locking `self.clients` afterwards just to format caps would
+        // add an avoidable panic point on a poisoned mutex.
+        let caps_summary = {
+            let mut v: Vec<&str> = capabilities.iter().map(String::as_str).collect();
+            v.sort();
+            v.join(",")
+        };
         let client = Arc::new(GuiClient {
             client_id: client_id.clone(),
             capabilities,
@@ -234,6 +242,9 @@ impl GuiRegistry {
             ))
             .spawn(move || heartbeat_loop(weak_client, weak_reg, cid, HeartbeatConfig::PROD));
 
+        log::info!(
+            "gui registered: client_id={client_id} primary={is_primary} caps={caps_summary}"
+        );
         (client_id, is_primary)
     }
 
@@ -255,6 +266,7 @@ impl GuiRegistry {
         drop(order);
         drop(clients);
         if let Some(client) = removed {
+            log::info!("gui unregistered: client_id={client_id}");
             client.fail_all_pending(ResponseError {
                 code: "gui_disconnected".into(),
                 message: "GUI client unregistered".into(),
