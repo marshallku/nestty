@@ -6,16 +6,28 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::thread;
 use std::time::Duration;
 
 use nestty_core::protocol::{Invoke, Request, Response};
+use nestty_core::thread_pool::Cancelable;
 use serde_json::Value;
 
 use crate::socket::SocketCommand;
 
 const PROTOCOL_VERSION: u32 = nestty_core::protocol::PROTOCOL_VERSION;
+
+/// Daemon→GUI invoke workers are mostly blocked on the GTK reply channel
+/// (`recv_timeout(125s)`), not on CPU. The size cap exists to stop a
+/// runaway plugin/webview burst from accumulating an unbounded number of
+/// idle waiters, not to maximize throughput. 8/32 is large enough for
+/// realistic concurrent webview + plugin command load and small enough
+/// to make pathological bursts surface as `overloaded` quickly.
+const POOL_WORKERS: usize = 8;
+const POOL_QUEUE: usize = 32;
 
 const CAPABILITIES: &[&str] = &[
     "tab",
@@ -41,11 +53,31 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 pub fn spawn(dispatch_tx: Sender<SocketCommand>) {
     thread::Builder::new()
         .name("nestty-gui-client".into())
-        .spawn(move || reconnect_loop(dispatch_tx))
+        .spawn(move || {
+            // Process-lifetime pool. Sharing across reconnects keeps
+            // ThreadPool::Drop (which drains the queue and joins workers,
+            // each potentially holding a 125s reply timeout) off the
+            // reconnect path.
+            //
+            // `generation` invalidates queued jobs across a disconnect:
+            // each `run()` invocation bumps it, and every `GuiInvokeJob`
+            // captures the generation it was admitted under. A worker
+            // that picks up a stale job (admitted while connection N was
+            // alive, executed after connection N+1 took over) writes an
+            // overloaded response back through its now-dead writer_tx
+            // instead of dispatching the side-effecting method.
+            let pool = nestty_core::thread_pool::ThreadPool::new(POOL_WORKERS, POOL_QUEUE);
+            let generation = Arc::new(AtomicU64::new(0));
+            reconnect_loop(dispatch_tx, pool, generation);
+        })
         .expect("spawn nestty-gui-client");
 }
 
-fn reconnect_loop(dispatch_tx: Sender<SocketCommand>) {
+fn reconnect_loop(
+    dispatch_tx: Sender<SocketCommand>,
+    pool: std::sync::Arc<nestty_core::thread_pool::ThreadPool>,
+    generation: Arc<AtomicU64>,
+) {
     let mut backoff = BACKOFF_INITIAL;
     loop {
         let socket_path = nestty_core::paths::socket_path();
@@ -53,6 +85,8 @@ fn reconnect_loop(dispatch_tx: Sender<SocketCommand>) {
         match run(
             &socket_path.to_string_lossy(),
             dispatch_tx.clone(),
+            pool.clone(),
+            generation.clone(),
             registered.clone(),
         ) {
             Ok(()) => eprintln!("[nestty] gui_client disconnected from daemon"),
@@ -73,8 +107,23 @@ fn reconnect_loop(dispatch_tx: Sender<SocketCommand>) {
 fn run(
     socket_path: &str,
     dispatch_tx: Sender<SocketCommand>,
+    pool: std::sync::Arc<nestty_core::thread_pool::ThreadPool>,
+    generation: Arc<AtomicU64>,
     registered: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), String> {
+    // Bump generation on entry AND on every exit (Drop guard). The exit
+    // bump is the critical one: between EOF and the next `run()` call
+    // the reconnect_loop sleeps for backoff, and without immediate
+    // invalidation a queued stale job could still pass the generation
+    // check during that window and side-effect through the GTK pump.
+    struct GenGuard<'a>(&'a Arc<AtomicU64>);
+    impl Drop for GenGuard<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let my_gen = generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+    let _gen_guard = GenGuard(&generation);
     let stream = UnixStream::connect(socket_path)
         .map_err(|e| format!("connect to nesttyd at {socket_path}: {e}"))?;
     let write_stream = stream
@@ -111,23 +160,27 @@ fn run(
 
         if let Some(method) = value.get("invoke").and_then(|v| v.as_str()) {
             // _ping handled inline on the reader thread — cheap echo,
-            // no GTK round-trip, no thread::spawn cost. Keeps heartbeat
-            // responsive even under thread-creation pressure.
+            // no GTK round-trip, no pool slot consumed. Keeps heartbeat
+            // responsive under burst load that saturates the pool.
             if method == "_ping" {
                 if let Err(e) = handle_ping(value, &writer_tx) {
                     log::warn!("[nestty] gui_client ping reply: {e}");
                 }
                 continue;
             }
-            // Slow path: worker per Invoke so the reader stays
-            // unblocked for the next _ping.
-            let dispatch_tx = dispatch_tx.clone();
-            let writer_tx = writer_tx.clone();
-            thread::spawn(move || {
-                if let Err(e) = handle_invoke(value, &dispatch_tx, &writer_tx) {
-                    log::warn!("[nestty] gui_client invoke worker: {e}");
-                }
+            // Slow path: bounded pool. Saturation → cancel inline,
+            // which writes back an `overloaded` Response so daemon's
+            // GuiClient::invoke unblocks immediately.
+            let job = Box::new(GuiInvokeJob {
+                value,
+                dispatch_tx: dispatch_tx.clone(),
+                writer_tx: writer_tx.clone(),
+                generation: generation.clone(),
+                admitted_gen: my_gen,
             });
+            if let Err(rejected) = pool.try_execute(job) {
+                rejected.cancel();
+            }
         } else if value.get("ok").is_some() {
             // Response to our gui.register or a heartbeat reply later.
             log::debug!("[nestty] gui_client response: {value}");
@@ -202,6 +255,64 @@ fn handle_ping(value: Value, writer_tx: &Sender<String>) -> Result<(), String> {
         .map_err(|_| "writer thread closed".to_string())
 }
 
+struct GuiInvokeJob {
+    value: Value,
+    dispatch_tx: Sender<SocketCommand>,
+    writer_tx: Sender<String>,
+    /// Bumped by every `run()` invocation. A job with `admitted_gen`
+    /// less than the current value comes from a dropped connection and
+    /// must NOT dispatch — `tab.new`, `terminal.exec`, `webview.*`, etc.
+    /// would otherwise side-effect after the daemon already failed the
+    /// pending invoke via `fail_all_pending`.
+    generation: Arc<AtomicU64>,
+    admitted_gen: u64,
+}
+
+impl GuiInvokeJob {
+    fn write_overloaded(value: &Value, writer_tx: &Sender<String>) {
+        // Best-effort id extraction. If parsing fails the daemon falls
+        // back to its 5/120s gui_timeout — not ideal, but cancel/stale
+        // paths must never panic.
+        let id = value
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let resp = Response::error(
+            id,
+            "overloaded",
+            "GUI invoke pool saturated; client cannot accept more concurrent invokes",
+        );
+        match serde_json::to_string(&resp) {
+            Ok(encoded) => {
+                let _ = writer_tx.send(encoded);
+            }
+            Err(e) => log::warn!("[nestty] gui_client cancel serialize: {e}"),
+        }
+    }
+}
+
+impl Cancelable for GuiInvokeJob {
+    fn run(self: Box<Self>) {
+        let this = *self;
+        // Generation check: if the connection we were admitted under is
+        // gone, treat as stale and write overloaded back through the
+        // (now-dead) writer_tx. Critical — without this, queued jobs
+        // would side-effect through the GTK dispatcher after disconnect.
+        if this.admitted_gen != this.generation.load(Ordering::SeqCst) {
+            Self::write_overloaded(&this.value, &this.writer_tx);
+            return;
+        }
+        if let Err(e) = handle_invoke(this.value, &this.dispatch_tx, &this.writer_tx) {
+            log::warn!("[nestty] gui_client invoke worker: {e}");
+        }
+    }
+
+    fn cancel(self: Box<Self>) {
+        Self::write_overloaded(&self.value, &self.writer_tx);
+    }
+}
+
 fn handle_invoke(
     value: Value,
     dispatch_tx: &Sender<SocketCommand>,
@@ -230,4 +341,136 @@ fn handle_invoke(
     writer_tx
         .send(encoded)
         .map_err(|_| "writer thread closed".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::mpsc::RecvTimeoutError;
+
+    fn invoke_value(id: &str, method: &str) -> Value {
+        json!({ "id": id, "invoke": method, "params": { "x": 1 } })
+    }
+
+    fn mk_job(
+        value: Value,
+        dispatch_tx: Sender<SocketCommand>,
+        writer_tx: Sender<String>,
+        generation: Arc<AtomicU64>,
+        admitted_gen: u64,
+    ) -> Box<GuiInvokeJob> {
+        Box::new(GuiInvokeJob {
+            value,
+            dispatch_tx,
+            writer_tx,
+            generation,
+            admitted_gen,
+        })
+    }
+
+    #[test]
+    fn run_dispatches_and_writes_reply() {
+        let (dispatch_tx, dispatch_rx) = channel::<SocketCommand>();
+        let (writer_tx, writer_rx) = channel::<String>();
+        let dispatcher = thread::spawn(move || {
+            let cmd = dispatch_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("dispatch_rx should receive a command");
+            cmd.reply
+                .send(Response::success(cmd.request.id, json!("ok")))
+                .unwrap();
+        });
+        let generation = Arc::new(AtomicU64::new(1));
+        let job = mk_job(
+            invoke_value("inv-1", "webview.eval"),
+            dispatch_tx,
+            writer_tx,
+            generation,
+            1,
+        );
+        Cancelable::run(job);
+        let line = writer_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer_tx should receive reply");
+        let resp: Response = serde_json::from_str(&line).unwrap();
+        assert_eq!(resp.id, "inv-1");
+        assert!(resp.ok);
+        dispatcher.join().unwrap();
+    }
+
+    #[test]
+    fn cancel_writes_overloaded_response() {
+        let (dispatch_tx, dispatch_rx) = channel::<SocketCommand>();
+        let (writer_tx, writer_rx) = channel::<String>();
+        let generation = Arc::new(AtomicU64::new(1));
+        let job = mk_job(
+            invoke_value("inv-2", "webview.eval"),
+            dispatch_tx,
+            writer_tx,
+            generation,
+            1,
+        );
+        Cancelable::cancel(job);
+        match dispatch_rx.recv_timeout(Duration::from_millis(50)) {
+            Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {}
+            Ok(_) => panic!("dispatch_rx unexpectedly produced a command"),
+        }
+        let line = writer_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer_tx should receive overloaded response");
+        let resp: Response = serde_json::from_str(&line).unwrap();
+        assert_eq!(resp.id, "inv-2");
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().code, "overloaded");
+    }
+
+    #[test]
+    fn cancel_with_missing_id_still_replies() {
+        let (dispatch_tx, _dispatch_rx) = channel::<SocketCommand>();
+        let (writer_tx, writer_rx) = channel::<String>();
+        let generation = Arc::new(AtomicU64::new(1));
+        let job = mk_job(
+            json!({ "invoke": "webview.eval", "params": {} }),
+            dispatch_tx,
+            writer_tx,
+            generation,
+            1,
+        );
+        Cancelable::cancel(job);
+        let line = writer_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer_tx should receive overloaded response even on malformed input");
+        let resp: Response = serde_json::from_str(&line).unwrap();
+        assert_eq!(resp.id, "");
+        assert_eq!(resp.error.unwrap().code, "overloaded");
+    }
+
+    #[test]
+    fn stale_generation_skips_dispatch() {
+        // Job admitted under generation=1 but current generation=2 →
+        // run() must skip handle_invoke (no command on dispatch_tx) and
+        // write back an overloaded response.
+        let (dispatch_tx, dispatch_rx) = channel::<SocketCommand>();
+        let (writer_tx, writer_rx) = channel::<String>();
+        let generation = Arc::new(AtomicU64::new(2));
+        let job = mk_job(
+            invoke_value("inv-stale", "tab.new"),
+            dispatch_tx,
+            writer_tx,
+            generation,
+            1,
+        );
+        Cancelable::run(job);
+        match dispatch_rx.recv_timeout(Duration::from_millis(50)) {
+            Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {}
+            Ok(_) => panic!("stale job must not dispatch any SocketCommand"),
+        }
+        let line = writer_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stale job must still write back a response");
+        let resp: Response = serde_json::from_str(&line).unwrap();
+        assert_eq!(resp.id, "inv-stale");
+        assert_eq!(resp.error.unwrap().code, "overloaded");
+    }
 }
