@@ -9,4 +9,5 @@ pub mod paths;
 pub mod plugin;
 pub mod protocol;
 pub mod theme;
+pub mod thread_pool;
 pub mod trigger;

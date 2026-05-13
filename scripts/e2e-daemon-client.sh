@@ -25,6 +25,10 @@ SOCKET="$WORK/nesttyd.sock"
 
 export NESTTY_SOCKET="$SOCKET"
 export RUST_LOG="${RUST_LOG:-info}"
+# Tiny pool + test-only action so step 6 can force saturation.
+export NESTTYD_POOL_WORKERS=2
+export NESTTYD_POOL_QUEUE=2
+export NESTTYD_E2E_TEST_ACTIONS=1
 
 DAEMON_PID=""
 GUI_PID=""
@@ -213,6 +217,60 @@ pass "heartbeat-miss path fired and unregistered ${client_2:0:8}…"
 
 # Resume so wait in cleanup doesn't hang
 kill -CONT "$GUI_PID" 2>/dev/null || true
+# Mock GUI is done with its part; let it exit so step 6's burst doesn't
+# fight a half-attached client over the same socket.
+kill -KILL "$GUI_PID" 2>/dev/null || true
+GUI_PID=""
+
+step 6 "pool saturation → overloaded"
+# Daemon's per-connection handler dispatches synchronously (recv_timeout
+# 120s), so concurrency comes from concurrent connections, not concurrent
+# requests on one socket. Fire N independent connections and assert ≥ 6
+# bounce back as overloaded.
+# Pool capacity = workers(2) + queue(2) = 4 in flight max.
+BURST_LOG="$WORK/burst.log"
+python3 - "$SOCKET" >"$BURST_LOG" 2>&1 <<'PY'
+import json, socket, sys, threading, time, uuid
+
+sock_path = sys.argv[1]
+N = 12
+
+def one_call(rid, out):
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(sock_path)
+        f = s.makefile("rwb", buffering=0)
+        req = {"id": rid, "method": "__test.slow_blocking", "params": {"ms": 400}}
+        f.write((json.dumps(req) + "\n").encode())
+        line = f.readline()
+        out.append(json.loads(line) if line else None)
+    except Exception as e:
+        out.append({"id": rid, "error": {"code": "connect_failed", "message": str(e)}})
+
+threads = []
+results = []
+for _ in range(N):
+    rid = str(uuid.uuid4())
+    result_slot = []
+    results.append(result_slot)
+    t = threading.Thread(target=one_call, args=(rid, result_slot), daemon=True)
+    threads.append(t)
+# Start them as close together as the GIL lets us.
+for t in threads:
+    t.start()
+for t in threads:
+    t.join(timeout=15)
+flat = [r[0] for r in results if r]
+received = sum(1 for m in flat if m is not None)
+overloaded = sum(1 for m in flat if m and (m.get("error") or {}).get("code") == "overloaded")
+print(json.dumps({"received": received, "overloaded": overloaded, "expected_n": N}))
+PY
+SUMMARY=$(tail -n1 "$BURST_LOG")
+received=$(python3 -c "import sys,json; print(json.loads(sys.argv[1])['received'])" "$SUMMARY")
+overloaded=$(python3 -c "import sys,json; print(json.loads(sys.argv[1])['overloaded'])" "$SUMMARY")
+(( received == 12 )) || fail "burst: expected 12 responses, got $received"
+(( overloaded >= 6 )) || fail "burst: expected ≥6 overloaded, got $overloaded"
+pass "burst: $received/12 responded, $overloaded overloaded"
 
 echo
 echo "=== AUTO E2E COMPLETE ==="

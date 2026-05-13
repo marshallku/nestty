@@ -169,3 +169,13 @@ For the action-handler side: `invoke_remote` blocks the calling thread on a ones
 **Tradeoff:** Higher thread count per service (3 + 1 wait + 1 per `subscribes` glob, plus transient workers per inbound recursive call). Justified at personal scale (a handful of services). The alternative — a single-threaded event loop with futures — would let us avoid threads but adds an async runtime dependency to `nestty-linux` that nothing else needs yet.
 
 **See:** `nestty-linux/src/service_supervisor.rs` for the implementation.
+
+## 19. Bounded Worker Pool for ActionRegistry (Phase 9.4)
+
+**Problem:** `ActionRegistry::try_dispatch` was spawning a fresh OS thread per blocking handler call. Combined with the daemon's per-connection handler threads and the GUI client's per-Invoke workers from Step 4b, a burst of slow plugin calls + concurrent webview operations could blow the process thread count. Three rounds of codex-plan pressure-test surfaced that the *caller policy* — how long to wait when the pool is saturated — couldn't be uniform: daemon connection threads tolerate brief backpressure, but GTK pump / heartbeat reader paths cannot block at all without breaking the live-ness contract Step 4b established.
+
+**Decision:** Replace the unbounded spawn with a bounded `ThreadPool` (crossbeam-channel, configurable workers + queue). Jobs implement a `Cancelable` trait — `run()` on a worker, `cancel()` synchronously on the caller's thread when the queue is full. Saturation surfaces as a new `overloaded` error code; `cancel()` also publishes `<action>.failed` so triggers waiting on completion don't hang. v1 wires the pool only from `nesttyd/main.rs`; `nestty-linux`'s in-process registry and `gui_client.rs` reader stay on the legacy spawn path (explicit scope-out, follow-up sub-steps).
+
+**Tradeoff:** Fixed upper bound on concurrency means burst load rejects requests during saturation rather than degrading via thread thrash. Acceptable because the alternative (spawn fallback under saturation) defeats the bound entirely. Explicit `pool.shutdown()` in `main.rs` guards against an Arc cycle (registry → handler closure → supervisor → registry) that could prevent automatic `Drop`. The `Cancelable` trait abstraction (vs raw `FnOnce`) is the only way the registry can keep ownership of its `Responder` across both `run` and `cancel` paths — boxing a `FnOnce` into a generic `Job` would orphan the responder on rejection.
+
+**See:** `nestty-core/src/thread_pool.rs` + `nestty-core/src/action_registry.rs` (`DispatchJob` impl).

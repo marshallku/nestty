@@ -12,9 +12,10 @@
 
 use crate::event_bus::{Event as BusEvent, EventBus};
 use crate::protocol::ResponseError;
+use crate::thread_pool::{Cancelable, ThreadPool};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 pub type ActionResult = Result<Value, ResponseError>;
 pub type ActionFn = Arc<dyn Fn(Value) -> ActionResult + Send + Sync + 'static>;
@@ -44,6 +45,11 @@ pub struct ActionRegistry {
     /// `<action>.failed` (Err) BEFORE the caller's `Responder` fires.
     /// `None` disables fan-out (default for unit tests).
     completion_bus: Option<Arc<EventBus>>,
+    /// When set, blocking handlers dispatch through a bounded worker pool
+    /// instead of `std::thread::spawn`. Saturation surfaces as an
+    /// `overloaded` error response. `None` keeps the legacy unbounded
+    /// behavior — kept as a fallback for callers that haven't migrated.
+    pool: Mutex<Option<Arc<ThreadPool>>>,
 }
 
 impl ActionRegistry {
@@ -51,6 +57,7 @@ impl ActionRegistry {
         Self {
             entries: RwLock::new(HashMap::new()),
             completion_bus: None,
+            pool: Mutex::new(None),
         }
     }
 
@@ -66,7 +73,23 @@ impl ActionRegistry {
         Self {
             entries: RwLock::new(HashMap::new()),
             completion_bus: Some(bus),
+            pool: Mutex::new(None),
         }
+    }
+
+    /// Routes blocking handlers through a bounded pool. Call once during
+    /// daemon startup before dispatch starts. A second call replaces the
+    /// pool (handy for tests) but `debug_assert`s the prior was unset.
+    pub fn with_pool(self: Arc<Self>, pool: Arc<ThreadPool>) -> Arc<Self> {
+        let prev = self.pool.lock().unwrap().replace(pool);
+        debug_assert!(prev.is_none(), "with_pool called twice");
+        self
+    }
+
+    /// Snapshot pool stats for observability (e.g., `daemon.info`).
+    /// `None` when no pool is wired.
+    pub fn pool_stats(&self) -> Option<crate::thread_pool::PoolStats> {
+        self.pool.lock().unwrap().as_ref().map(|p| p.stats())
     }
 
     /// Sync handler; `try_dispatch` runs it inline. Use only for
@@ -181,15 +204,31 @@ impl ActionRegistry {
         };
         let action_name = name.to_string();
         if blocking {
-            // Spawn a worker. The handler's Arc keeps it alive
-            // independent of the registry's HashMap, so a concurrent
-            // `register` overwrite can't pull the handler out from
-            // under the worker.
-            std::thread::spawn(move || {
-                let result = handler(params);
-                publish_completion(publish_bus.as_deref(), &action_name, &result);
-                on_done(result);
-            });
+            let pool_snapshot = self.pool.lock().unwrap().clone();
+            if let Some(pool) = pool_snapshot {
+                let job = Box::new(DispatchJob {
+                    handler,
+                    params,
+                    on_done,
+                    publish_bus,
+                    action_name,
+                });
+                if let Err(rejected) = pool.try_execute(job) {
+                    // Synchronous cancel on the caller thread: publishes
+                    // `<action>.failed` and fires on_done with an
+                    // `overloaded` error so no caller is ever orphaned.
+                    rejected.cancel();
+                }
+            } else {
+                // Legacy fallback: unbounded spawn. Kept for callers that
+                // haven't wired a pool (notably nestty-linux's in-process
+                // registry — to be migrated in a later phase).
+                std::thread::spawn(move || {
+                    let result = handler(params);
+                    publish_completion(publish_bus.as_deref(), &action_name, &result);
+                    on_done(result);
+                });
+            }
         } else {
             let result = handler(params);
             publish_completion(publish_bus.as_deref(), &action_name, &result);
@@ -238,6 +277,37 @@ impl Default for ActionRegistry {
 /// only — when the downstream chained trigger actually fires depends on the
 /// platform pump cadence (nestty-linux: next GTK tick). Semantically-correct
 /// chaining is guaranteed; same-tick chaining is not.
+struct DispatchJob {
+    handler: ActionFn,
+    params: Value,
+    on_done: Responder,
+    publish_bus: Option<Arc<EventBus>>,
+    action_name: String,
+}
+
+impl Cancelable for DispatchJob {
+    fn run(self: Box<Self>) {
+        let this = *self;
+        let result = (this.handler)(this.params);
+        publish_completion(this.publish_bus.as_deref(), &this.action_name, &result);
+        (this.on_done)(result);
+    }
+
+    fn cancel(self: Box<Self>) {
+        let this = *self;
+        let err = ResponseError {
+            code: "overloaded".into(),
+            message: format!(
+                "action queue saturated; {} was not dispatched",
+                this.action_name
+            ),
+        };
+        let result: ActionResult = Err(err);
+        publish_completion(this.publish_bus.as_deref(), &this.action_name, &result);
+        (this.on_done)(result);
+    }
+}
+
 fn publish_completion(bus: Option<&EventBus>, action: &str, result: &ActionResult) {
     let Some(bus) = bus else { return };
     let (kind, payload) = match result {
@@ -769,5 +839,95 @@ mod tests {
         assert!(reg.is_blocking("x"));
         reg.register("x", |_| Ok(json!("sync2")));
         assert!(!reg.is_blocking("x"));
+    }
+
+    #[test]
+    fn pool_routes_blocking_handler_to_pool_worker() {
+        use crate::thread_pool::ThreadPool;
+        let pool = ThreadPool::new(2, 4);
+        let reg = Arc::new(ActionRegistry::new()).with_pool(pool.clone());
+        let caller = std::thread::current().id();
+        let observed = Arc::new(Mutex::new(None::<std::thread::ThreadId>));
+        let obs_in_handler = observed.clone();
+        reg.register_blocking("on_pool", move |_| {
+            *obs_in_handler.lock().unwrap() = Some(std::thread::current().id());
+            Ok(json!("done"))
+        });
+        let done = Arc::new(Mutex::new(false));
+        let d = done.clone();
+        reg.try_dispatch(
+            "on_pool",
+            json!({}),
+            Box::new(move |_| {
+                *d.lock().unwrap() = true;
+            }),
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !*done.lock().unwrap() {
+            assert!(Instant::now() < deadline, "on_done never fired");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let worker_id = observed.lock().unwrap().expect("handler must have run");
+        assert_ne!(worker_id, caller, "handler should run on a pool worker");
+        // The pool worker name should be one of ours.
+        // (Can't inspect Thread::name() through ThreadId; just rely on
+        // ID inequality + the fact that try_dispatch returned.)
+        drop(pool);
+    }
+
+    #[test]
+    fn pool_saturation_yields_overloaded_response() {
+        use crate::thread_pool::ThreadPool;
+        // 1 worker + 1 queue slot = at most 2 in flight; further work
+        // should be cancelled with `overloaded`.
+        let pool = ThreadPool::new(1, 1);
+        let bus = Arc::new(EventBus::new());
+        let rx = bus.subscribe_unbounded("slowping.failed");
+        let reg =
+            Arc::new(ActionRegistry::with_completion_bus(bus.clone())).with_pool(pool.clone());
+        reg.register_blocking("slowping", |_| {
+            std::thread::sleep(Duration::from_millis(300));
+            Ok(json!({}))
+        });
+        let mut callbacks = Vec::new();
+        let mut received = Vec::new();
+        for _ in 0..6 {
+            let (tx, rx) = std::sync::mpsc::channel::<ActionResult>();
+            received.push(rx);
+            reg.try_dispatch(
+                "slowping",
+                json!({}),
+                Box::new(move |r| {
+                    let _ = tx.send(r);
+                }),
+            );
+            callbacks.push(());
+        }
+        // All 6 callers must get a response (no orphans).
+        let mut overloaded_count = 0;
+        for rx in received {
+            let result = rx.recv_timeout(Duration::from_secs(5)).expect("orphan");
+            if let Err(e) = &result
+                && e.code == "overloaded"
+            {
+                overloaded_count += 1;
+            }
+        }
+        assert!(
+            overloaded_count >= 3,
+            "expected ≥3 overloaded; got {overloaded_count}"
+        );
+        // And `<action>.failed` must publish for at least the overload count.
+        let mut failed_events = 0;
+        while let crate::event_bus::RecvOutcome::Event(_) =
+            rx.recv_timeout(Duration::from_millis(50))
+        {
+            failed_events += 1;
+        }
+        assert!(
+            failed_events >= overloaded_count,
+            "expected ≥{overloaded_count} failed events; got {failed_events}"
+        );
+        drop(pool);
     }
 }
