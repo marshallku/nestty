@@ -5,7 +5,9 @@
 use std::collections::{HashMap, HashSet};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Sender, channel};
+#[cfg(test)]
+use std::sync::mpsc::sync_channel;
+use std::sync::mpsc::{Sender, SyncSender, channel};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -74,7 +76,10 @@ pub struct GuiClient {
     pub client_id: String,
     pub capabilities: HashSet<String>,
     pub want_primary: bool,
-    writer_tx: Sender<String>,
+    /// Bounded so a wedged GUI socket writer can't let the event
+    /// forwarder accumulate memory without limit. See the buffer-size
+    /// rationale where this channel is created (`socket.rs`).
+    writer_tx: SyncSender<String>,
     /// `None` after `fail_all_pending` (= unregister) so a stale Arc held
     /// across a disconnect can't insert a new pending entry that nobody
     /// will ever resolve.
@@ -123,9 +128,18 @@ impl GuiClient {
                 );
             }
         };
-        if self.writer_tx.send(line).is_err() {
+        // try_send (not send): a full buffer must NOT block this thread,
+        // because the heartbeat loop calls `invoke` and a block here
+        // would prevent the very miss-count that's supposed to detect
+        // and tear down a wedged GUI. Full → treat like disconnected;
+        // heartbeat will increment misses and unregister.
+        if self.writer_tx.try_send(line).is_err() {
             self.remove_pending(&invoke_id);
-            return Response::error(String::new(), "gui_disconnected", "GUI writer closed");
+            return Response::error(
+                String::new(),
+                "gui_disconnected",
+                "GUI writer unreachable (channel full or closed)",
+            );
         }
         match rx.recv_timeout(timeout) {
             Ok(resp) => resp,
@@ -206,7 +220,7 @@ impl GuiRegistry {
         self: &Arc<Self>,
         capabilities: HashSet<String>,
         want_primary: bool,
-        writer_tx: Sender<String>,
+        writer_tx: SyncSender<String>,
         shutdown_handle: Option<UnixStream>,
     ) -> (String, bool) {
         let client_id = uuid::Uuid::new_v4().to_string();
@@ -368,9 +382,20 @@ fn forwarder_loop(
                         continue;
                     }
                 };
-                if client.writer_tx.send(line).is_err() {
-                    // Writer thread gone; the connection is dead. Exit.
-                    return;
+                use std::sync::mpsc::TrySendError;
+                match client.writer_tx.try_send(line) {
+                    Ok(_) => {}
+                    // Channel full: GUI socket wedged. Drop this event
+                    // so we don't block the loop (and starve our own
+                    // stop-flag check). Heartbeat is on the same
+                    // writer_tx — it'll fail-fast too, unregister, and
+                    // close the connection. event loss is acceptable
+                    // because (a) the GUI is already malfunctioning and
+                    // (b) the unregister torch-down recovers cleanly.
+                    Err(TrySendError::Full(_)) => {
+                        log::debug!("event forwarder: writer_tx full, dropping event");
+                    }
+                    Err(TrySendError::Disconnected(_)) => return,
                 }
             }
             RecvOutcome::Timeout => continue,
@@ -436,7 +461,7 @@ mod tests {
     #[test]
     fn first_want_primary_becomes_primary() {
         let reg = GuiRegistry::new();
-        let (tx, _rx) = channel::<String>();
+        let (tx, _rx) = sync_channel::<String>(64);
         let (_, is_primary) = reg.register(mk_caps(&["tab"]), true, tx, None);
         assert!(is_primary);
     }
@@ -444,10 +469,10 @@ mod tests {
     #[test]
     fn want_primary_false_stays_secondary() {
         let reg = GuiRegistry::new();
-        let (tx, _rx) = channel::<String>();
+        let (tx, _rx) = sync_channel::<String>(64);
         let (_, is_primary) = reg.register(mk_caps(&["tab"]), false, tx, None);
         assert!(!is_primary);
-        let (tx2, _rx2) = channel::<String>();
+        let (tx2, _rx2) = sync_channel::<String>(64);
         let (_, is_primary2) = reg.register(mk_caps(&["tab"]), true, tx2, None);
         assert!(is_primary2);
     }
@@ -455,9 +480,9 @@ mod tests {
     #[test]
     fn second_register_with_want_primary_stays_secondary() {
         let reg = GuiRegistry::new();
-        let (tx1, _rx1) = channel::<String>();
+        let (tx1, _rx1) = sync_channel::<String>(64);
         let (_, p1) = reg.register(mk_caps(&["tab"]), true, tx1, None);
-        let (tx2, _rx2) = channel::<String>();
+        let (tx2, _rx2) = sync_channel::<String>(64);
         let (_, p2) = reg.register(mk_caps(&["tab"]), true, tx2, None);
         assert!(p1);
         assert!(!p2);
@@ -466,7 +491,7 @@ mod tests {
     #[test]
     fn route_returns_primary_for_matching_capability() {
         let reg = GuiRegistry::new();
-        let (tx, _rx) = channel::<String>();
+        let (tx, _rx) = sync_channel::<String>(64);
         let (cid, _) = reg.register(mk_caps(&["tab", "split"]), true, tx, None);
         let client = reg.route("tab.list", None).expect("routed");
         assert_eq!(client.client_id, cid);
@@ -481,7 +506,7 @@ mod tests {
     #[test]
     fn route_no_gui_when_capability_missing() {
         let reg = GuiRegistry::new();
-        let (tx, _rx) = channel::<String>();
+        let (tx, _rx) = sync_channel::<String>(64);
         reg.register(mk_caps(&["split"]), true, tx, None); // no "tab" cap
         assert_eq!(reg.route("tab.list", None).err(), Some("no_gui"));
     }
@@ -489,9 +514,9 @@ mod tests {
     #[test]
     fn route_target_client_id_picks_specific() {
         let reg = GuiRegistry::new();
-        let (tx_primary, _rx_p) = channel::<String>();
+        let (tx_primary, _rx_p) = sync_channel::<String>(64);
         let (_, _) = reg.register(mk_caps(&["tab"]), true, tx_primary, None);
-        let (tx_secondary, _rx_s) = channel::<String>();
+        let (tx_secondary, _rx_s) = sync_channel::<String>(64);
         let (secondary_id, _) = reg.register(mk_caps(&["tab"]), false, tx_secondary, None);
         let client = reg.route("tab.list", Some(&secondary_id)).expect("routed");
         assert_eq!(client.client_id, secondary_id);
@@ -509,7 +534,7 @@ mod tests {
     #[test]
     fn route_non_gui_owned_method_returns_not_gui_owned() {
         let reg = GuiRegistry::new();
-        let (tx, _rx) = channel::<String>();
+        let (tx, _rx) = sync_channel::<String>(64);
         reg.register(mk_caps(&["tab"]), true, tx, None);
         assert_eq!(reg.route("system.ping", None).err(), Some("not_gui_owned"));
     }
@@ -517,11 +542,11 @@ mod tests {
     #[test]
     fn unregister_primary_promotes_most_recent_want_primary() {
         let reg = GuiRegistry::new();
-        let (tx1, _rx1) = channel::<String>();
+        let (tx1, _rx1) = sync_channel::<String>(64);
         let (id1, _) = reg.register(mk_caps(&["tab"]), true, tx1, None);
-        let (tx2, _rx2) = channel::<String>();
+        let (tx2, _rx2) = sync_channel::<String>(64);
         let (id2, _) = reg.register(mk_caps(&["tab"]), true, tx2, None);
-        let (tx3, _rx3) = channel::<String>();
+        let (tx3, _rx3) = sync_channel::<String>(64);
         let (id3, _) = reg.register(mk_caps(&["tab"]), true, tx3, None);
         // Drop the original primary (id1). Most-recent (id3) should win,
         // not id2 (the second-oldest).
@@ -539,7 +564,7 @@ mod tests {
     #[test]
     fn invoke_timeout_returns_gui_timeout_error() {
         let reg = GuiRegistry::new();
-        let (writer_tx, _writer_rx) = channel();
+        let (writer_tx, _writer_rx) = sync_channel(64);
         let (_, _) = reg.register(mk_caps(&["tab"]), true, writer_tx, None);
         let client = reg.route("tab.list", None).unwrap();
         let resp = client.invoke("tab.list", json!({}), Duration::from_millis(50));
@@ -553,7 +578,7 @@ mod tests {
         // writer_rx is dropped immediately, so every invoke fails fast
         // with gui_disconnected — counts as a heartbeat miss.
         let reg = GuiRegistry::new();
-        let (writer_tx, writer_rx) = channel::<String>();
+        let (writer_tx, writer_rx) = sync_channel::<String>(64);
         drop(writer_rx);
         let (cid, _) = reg.register(mk_caps(&["tab"]), true, writer_tx, None);
         let client = reg.get(&cid).unwrap();
@@ -589,7 +614,7 @@ mod tests {
         // unregister fires, then the caller still tries to invoke. Must
         // surface gui_disconnected, not wait for the full timeout.
         let reg = GuiRegistry::new();
-        let (writer_tx, _writer_rx) = channel::<String>();
+        let (writer_tx, _writer_rx) = sync_channel::<String>(64);
         let (cid, _) = reg.register(mk_caps(&["tab"]), true, writer_tx, None);
         let client = reg.get(&cid).unwrap();
         reg.unregister(&cid);
@@ -607,7 +632,7 @@ mod tests {
     #[test]
     fn unregister_fails_pending_invokes_with_disconnect() {
         let reg = GuiRegistry::new();
-        let (writer_tx, _writer_rx) = channel();
+        let (writer_tx, _writer_rx) = sync_channel(64);
         let (cid, _) = reg.register(mk_caps(&["tab"]), true, writer_tx, None);
         let client = reg.get(&cid).unwrap();
         // Issue a pending Invoke from a worker, unregister, expect it to
@@ -631,7 +656,7 @@ mod tests {
         // + payload.
         let reg = GuiRegistry::new();
         let bus = Arc::new(EventBus::new());
-        let (writer_tx, writer_rx) = channel::<String>();
+        let (writer_tx, writer_rx) = sync_channel::<String>(64);
         let (cid, _) = reg.register(mk_caps(&["tab"]), true, writer_tx, None);
         reg.start_event_forwarder(&cid, bus.clone());
         // Give the forwarder a tick to enter recv_timeout.
@@ -650,12 +675,35 @@ mod tests {
     }
 
     #[test]
+    fn invoke_fast_fails_when_writer_buffer_full() {
+        // Buffer 1, no consumer (writer_rx dropped) → first send fills
+        // the buffer with the new-pending Invoke line, second send
+        // returns Full → invoke must return immediately with
+        // gui_disconnected (not block the heartbeat path).
+        let reg = GuiRegistry::new();
+        let (writer_tx, writer_rx) = sync_channel::<String>(1);
+        drop(writer_rx);
+        let (cid, _) = reg.register(mk_caps(&["tab"]), true, writer_tx, None);
+        let client = reg.get(&cid).unwrap();
+        // First call hits the dropped-receiver path (Disconnected).
+        let start = std::time::Instant::now();
+        let resp = client.invoke("tab.list", json!({}), Duration::from_secs(5));
+        assert!(!resp.ok);
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "must NOT block on full/closed buffer, took {:?}",
+            start.elapsed()
+        );
+        assert_eq!(resp.error.unwrap().code, "gui_disconnected");
+    }
+
+    #[test]
     fn event_forwarder_stops_on_unregister() {
         // After unregister, no more events flow even if the bus keeps
         // publishing. (forwarder_stop flag flipped by fail_all_pending.)
         let reg = GuiRegistry::new();
         let bus = Arc::new(EventBus::new());
-        let (writer_tx, writer_rx) = channel::<String>();
+        let (writer_tx, writer_rx) = sync_channel::<String>(64);
         let (cid, _) = reg.register(mk_caps(&["tab"]), true, writer_tx, None);
         reg.start_event_forwarder(&cid, bus.clone());
         thread::sleep(Duration::from_millis(50));

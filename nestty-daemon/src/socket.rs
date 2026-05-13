@@ -251,7 +251,15 @@ fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) {
     // this reader thread.
     let shutdown_stream = stream.try_clone().ok();
 
-    let (writer_tx, writer_rx) = mpsc::channel::<String>();
+    // Bounded — `auto-subscribe-all` plus a wedged GUI socket writer
+    // would otherwise let `forwarder_loop` accumulate unbounded events
+    // in the channel. 512 lines is plenty of headroom for normal bursts
+    // and far below any memory pressure. When the buffer fills, the
+    // forwarder blocks on `send`; heartbeat-miss eventually unregisters
+    // the client and `fail_all_pending` shuts the socket down, which
+    // wakes the writer (and hence the blocked forwarder) with EOF /
+    // Disconnect — see `gui_registry::forwarder_loop`.
+    let (writer_tx, writer_rx) = mpsc::sync_channel::<String>(512);
     thread::spawn(move || {
         let mut writer = write_stream;
         while let Ok(line) = writer_rx.recv() {
@@ -360,7 +368,7 @@ fn parse_wire(line: &str) -> WireMessage {
     }
 }
 
-fn send_line(tx: &mpsc::Sender<String>, response: &Response) {
+fn send_line(tx: &mpsc::SyncSender<String>, response: &Response) {
     match serde_json::to_string(response) {
         Ok(s) => {
             let _ = tx.send(s);
@@ -372,7 +380,7 @@ fn send_line(tx: &mpsc::Sender<String>, response: &Response) {
 fn handle_gui_register(
     req: &Request,
     state: &Arc<DaemonState>,
-    writer_tx: mpsc::Sender<String>,
+    writer_tx: mpsc::SyncSender<String>,
     shutdown_handle: Option<UnixStream>,
 ) -> (Response, Option<String>) {
     let caps = req
