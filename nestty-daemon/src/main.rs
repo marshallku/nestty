@@ -1,19 +1,33 @@
 //! `nesttyd` binary entry. Hosts the daemon-side `ActionRegistry`
 //! (builtins + plugins via `ServiceSupervisor`) and the GUI registry.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
-use nestty_core::action_registry::{ActionRegistry, internal_error};
+use nestty_core::action_registry::{ActionRegistry, internal_error, invalid_params};
 use nestty_core::paths;
+use nestty_core::plugin::LoadedPlugin;
+use nestty_core::protocol::ResponseError;
 use nestty_core::thread_pool::ThreadPool;
+use nestty_daemon::plugin_exec::{ShellError, spawn_plugin_shell};
 use nestty_daemon::service_supervisor::ServiceSupervisor;
 use nestty_daemon::socket::{
     self, DaemonState, LEGACY_DISPATCH_METHODS, SocketPrep, new_event_bus,
 };
 use nestty_daemon::trigger_sink::TRIGGER_ONLY_RESERVED_METHODS;
 use serde_json::json;
+
+/// `plugin.<name>.<cmd>` inherits the supervisor's 120s action_timeout;
+/// the inner timeout is below that so the watchdog's kill+reap path
+/// always wins the race over the registry's outer 120s recv_timeout.
+const PLUGIN_CMD_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Statusbar modules tick at 10s default. Generous-but-bounded so a
+/// runaway module can't pile up across ticks.
+const MODULE_RUN_TIMEOUT: Duration = Duration::from_secs(8);
 
 const ENV_E2E_ACTIONS: &str = "NESTTYD_E2E_TEST_ACTIONS";
 const ENV_POOL_WORKERS: &str = "NESTTYD_POOL_WORKERS";
@@ -54,6 +68,7 @@ fn main() -> ExitCode {
         Arc::new(ActionRegistry::with_completion_bus(event_bus.clone())).with_pool(pool.clone());
     let plugins = discover_and_sort_plugins();
     register_builtins(&actions, &plugins);
+    register_plugin_commands(&actions, &plugins, &socket_path);
     if env_flag_enabled(ENV_E2E_ACTIONS) {
         register_e2e_actions(&actions);
     }
@@ -128,6 +143,141 @@ fn register_e2e_actions(actions: &Arc<ActionRegistry>) {
         std::thread::sleep(std::time::Duration::from_millis(ms));
         Ok(json!({ "slept_ms": ms }))
     });
+}
+
+fn register_plugin_commands(
+    actions: &Arc<ActionRegistry>,
+    plugins: &Arc<Vec<LoadedPlugin>>,
+    socket_path: &Path,
+) {
+    let socket_str = socket_path.to_string_lossy().into_owned();
+    // Iterate only the WINNING entry per unique plugin name (sorted
+    // slice → resolve_by_name returns the last-by-dir entry). Without
+    // this dedup, a losing duplicate with a command name the winner
+    // does NOT have would leak into the dispatch table; only collisions
+    // on the same `<name>.<cmd>` method get HashMap-overwritten.
+    let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let winners: Vec<&LoadedPlugin> = plugins
+        .iter()
+        .rev()
+        .filter(|p| seen_names.insert(p.manifest.plugin.name.as_str()))
+        .collect();
+    for plugin in winners.iter() {
+        let plugin_name = plugin.manifest.plugin.name.clone();
+        for cmd in &plugin.manifest.commands {
+            // A dot in the command name would create a 4+ segment
+            // method that breaks `plugin.<name>.<cmd>` parsing for
+            // downstream consumers (the trigger engine, the CLI).
+            if cmd.name.contains('.') {
+                log::warn!(
+                    "plugin {} command `{}` contains a dot; skipping registration",
+                    plugin_name,
+                    cmd.name
+                );
+                continue;
+            }
+            let method = format!("plugin.{}.{}", plugin_name, cmd.name);
+            let exec = cmd.exec.clone();
+            let dir = plugin.dir.clone();
+            let socket = socket_str.clone();
+            actions.register_blocking(method, move |params| {
+                run_plugin_shell(
+                    &dir,
+                    &exec,
+                    &params.to_string(),
+                    &socket,
+                    PLUGIN_CMD_TIMEOUT,
+                )
+                .map(parse_plugin_stdout)
+                .map_err(map_shell_error)
+            });
+        }
+    }
+    let plugins_for_module = plugins.clone();
+    let socket_for_module = socket_str;
+    actions.register_blocking_silent("_module.run", move |params| {
+        let plugin_name = params
+            .get("plugin")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| invalid_params("missing 'plugin' field"))?;
+        let module_name = params
+            .get("module")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| invalid_params("missing 'module' field"))?;
+        // `resolve_by_name` picks the sorted-last (winner) entry,
+        // matching `register_plugin_commands`' winners-only set.
+        let plugin = nestty_core::plugin::resolve_by_name(&plugins_for_module, plugin_name)
+            .ok_or_else(|| ResponseError {
+                code: "not_found".into(),
+                message: format!("plugin not found: {plugin_name}"),
+            })?;
+        let module = plugin
+            .manifest
+            .modules
+            .iter()
+            .find(|m| m.name == module_name)
+            .ok_or_else(|| ResponseError {
+                code: "not_found".into(),
+                message: format!("module '{module_name}' not in plugin '{plugin_name}'"),
+            })?;
+        let out = run_plugin_shell(
+            &plugin.dir,
+            &module.exec,
+            "",
+            &socket_for_module,
+            MODULE_RUN_TIMEOUT,
+        )
+        .map_err(map_shell_error)?;
+        Ok(json!({
+            "stdout": out.stdout,
+            "exit_code": out.exit_code,
+        }))
+    });
+}
+
+fn run_plugin_shell(
+    dir: &Path,
+    exec: &str,
+    stdin_payload: &str,
+    socket_path: &str,
+    timeout: Duration,
+) -> Result<nestty_daemon::plugin_exec::ShellOutput, ShellError> {
+    let mut env = HashMap::new();
+    env.insert("NESTTY_SOCKET".into(), socket_path.into());
+    env.insert(
+        "NESTTY_PLUGIN_DIR".into(),
+        dir.to_string_lossy().into_owned(),
+    );
+    spawn_plugin_shell(dir, exec, stdin_payload.as_bytes(), &env, timeout)
+}
+
+/// Mirrors the legacy GUI handler's contract: JSON stdout is returned
+/// verbatim; otherwise wrap the trimmed text under `{ "output": ... }`
+/// so the caller always receives a JSON object.
+fn parse_plugin_stdout(out: nestty_daemon::plugin_exec::ShellOutput) -> serde_json::Value {
+    serde_json::from_str::<serde_json::Value>(&out.stdout)
+        .unwrap_or_else(|_| json!({ "output": out.stdout.trim() }))
+}
+
+fn map_shell_error(err: ShellError) -> ResponseError {
+    match err {
+        ShellError::NonZero(out) => ResponseError {
+            code: "plugin_command_failed".into(),
+            message: format!(
+                "exit {}: {}",
+                out.exit_code,
+                out.stderr.trim().lines().next().unwrap_or("")
+            ),
+        },
+        ShellError::Timeout { after, .. } => ResponseError {
+            code: "plugin_timeout".into(),
+            message: format!("plugin shell did not complete within {after:?}"),
+        },
+        ShellError::Spawn(msg) | ShellError::Wait(msg) => ResponseError {
+            code: "plugin_spawn_failed".into(),
+            message: msg,
+        },
+    }
 }
 
 fn register_builtins(
@@ -218,20 +368,11 @@ fn env_flag_enabled(var: &str) -> bool {
 /// (deterministic last-write-wins on duplicates). Warns about dupes so
 /// the user can fix the manifest.
 pub fn discover_and_sort_plugins() -> Arc<Vec<nestty_core::plugin::LoadedPlugin>> {
-    let mut plugins = nestty_core::plugin::discover_plugins();
-    // Sort by name, then by dir as a stable tiebreaker so two plugins
-    // with the same manifest name resolve to the same winner across
-    // restarts regardless of filesystem readdir order.
-    plugins.sort_by(|a, b| {
-        a.manifest
-            .plugin
-            .name
-            .cmp(&b.manifest.plugin.name)
-            .then_with(|| a.dir.cmp(&b.dir))
-    });
+    let plugins = nestty_core::plugin::discover_sorted_plugins();
     // After sort: equal names are adjacent and ordered by dir.
     // `register_blocking` does last-write-wins on HashMap insertion,
     // so the entry registered LAST (largest dir) is the active one.
+    // `nestty_core::plugin::resolve_by_name` picks the same winner.
     let mut prev: Option<&str> = None;
     for p in &plugins {
         let name = p.manifest.plugin.name.as_str();

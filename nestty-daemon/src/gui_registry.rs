@@ -49,10 +49,6 @@ pub fn method_capability(method: &str) -> Option<&'static str> {
         "agent.approve" => Some("agent.ui"),
         "plugin.open" => Some("plugin.open"),
         "session.list" | "session.info" => Some("session"),
-        // `plugin.<name>.<cmd>` shell commands from a plugin manifest's
-        // `[[commands]]`. GUI-routed because nestty-linux's existing
-        // dispatch resolves them via `TabManager::plugins()`.
-        m if m.starts_with("plugin.") && m.matches('.').count() == 2 => Some("plugin.open"),
         _ => None,
     }
 }
@@ -62,10 +58,7 @@ pub fn method_capability(method: &str) -> Option<&'static str> {
 /// upstream, so we match that for any method that can transitively trigger
 /// a plugin RPC or a heavy WebView call.
 pub fn method_invoke_timeout(method: &str) -> Duration {
-    if method.starts_with("webview.")
-        || method == "claude.start"
-        || (method.starts_with("plugin.") && method.matches('.').count() == 2)
-    {
+    if method.starts_with("webview.") || method == "claude.start" {
         Duration::from_secs(120)
     } else {
         Duration::from_secs(5)
@@ -427,6 +420,15 @@ mod tests {
         assert_eq!(method_capability("claude.start"), Some("tab"));
         assert_eq!(method_capability("system.ping"), None);
         assert_eq!(method_capability("kb.search"), None);
+    }
+
+    #[test]
+    fn plugin_dot_name_dot_cmd_is_daemon_owned() {
+        // Daemon hosts plugin manifest commands directly; no GUI routing.
+        assert_eq!(method_capability("plugin.echo.greet"), None);
+        assert_eq!(method_capability("plugin.todo.add"), None);
+        // Single-dot `plugin.open` and `plugin.list` are unaffected.
+        assert_eq!(method_capability("plugin.open"), Some("plugin.open"));
     }
 
     #[test]

@@ -189,8 +189,10 @@ impl NesttyWindow {
             pump_state.borrow().trigger_subs_len()
         );
 
-        // Plugin discovery
-        let plugins = nestty_core::plugin::discover_plugins();
+        // Plugin discovery — sorted so plugin-by-name resolvers (panel
+        // open, statusbar module timer) agree with the daemon's
+        // `resolve_by_name` on duplicate manifest names.
+        let plugins = nestty_core::plugin::discover_sorted_plugins();
         for p in &plugins {
             eprintln!(
                 "[nestty] plugin loaded: {} v{}",
@@ -277,7 +279,6 @@ impl NesttyWindow {
 
         let mgr = tab_manager.clone();
         let win = window.clone();
-        let sp = socket_path.clone();
         let sb = statusbar.clone();
         let bg = background.clone();
         let act = actions.clone();
@@ -302,11 +303,11 @@ impl NesttyWindow {
             // same batch (e.g. `context.snapshot`) must see those events
             // applied to ContextService.
             while let Ok(cmd) = socket_rx.try_recv() {
-                socket::dispatch(cmd, &mgr, &win, &sp, &sb, &bg, &act);
+                socket::dispatch(cmd, &mgr, &win, &sb, &bg, &act);
                 pump_state_timer.borrow().drain_context_only(&ctx_pump);
             }
             while let Ok(cmd) = plugin_dispatch_rx.try_recv() {
-                socket::dispatch(cmd, &mgr, &win, &sp, &sb, &bg, &act);
+                socket::dispatch(cmd, &mgr, &win, &sb, &bg, &act);
                 pump_state_timer.borrow().drain_context_only(&ctx_pump);
             }
             glib::ControlFlow::Continue

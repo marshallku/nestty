@@ -226,9 +226,71 @@ pub fn discover_plugins() -> Vec<LoadedPlugin> {
     plugins
 }
 
+/// Discovery + canonical sort: by `manifest.plugin.name` then by `dir` as
+/// the stable tiebreaker for duplicates. Use this everywhere a plugin
+/// name needs to resolve to a single manifest, so daemon dispatch and
+/// GUI panel/command resolution pick the same winner under duplicate
+/// names.
+pub fn discover_sorted_plugins() -> Vec<LoadedPlugin> {
+    let mut plugins = discover_plugins();
+    plugins.sort_by(|a, b| {
+        a.manifest
+            .plugin
+            .name
+            .cmp(&b.manifest.plugin.name)
+            .then_with(|| a.dir.cmp(&b.dir))
+    });
+    plugins
+}
+
+/// On a `discover_sorted_plugins` slice, returns the duplicate winner
+/// for `name` (sorted-last entry). Callers that resolve a plugin by
+/// name (panel open, command dispatch, module exec) must consume a
+/// sorted slice for results to agree across daemon and GUI.
+pub fn resolve_by_name<'a>(plugins: &'a [LoadedPlugin], name: &str) -> Option<&'a LoadedPlugin> {
+    plugins
+        .iter()
+        .rev()
+        .find(|p| p.manifest.plugin.name == name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mk_loaded(name: &str, dir: &str) -> LoadedPlugin {
+        LoadedPlugin {
+            manifest: PluginManifest {
+                plugin: PluginMeta {
+                    name: name.into(),
+                    title: name.into(),
+                    version: "0".into(),
+                    description: None,
+                },
+                panels: Vec::new(),
+                commands: Vec::new(),
+                modules: Vec::new(),
+                services: Vec::new(),
+            },
+            dir: std::path::PathBuf::from(dir),
+        }
+    }
+
+    #[test]
+    fn resolve_by_name_returns_sorted_last_entry_under_duplicates() {
+        // Caller is expected to pass a sorted slice (same shape as
+        // `discover_sorted_plugins`'s output). The last entry with a
+        // matching name wins — matches daemon dispatch's HashMap
+        // last-write-wins ordering.
+        let plugins = vec![
+            mk_loaded("dup", "/plugins/a"),
+            mk_loaded("dup", "/plugins/b"),
+            mk_loaded("other", "/plugins/c"),
+        ];
+        let winner = resolve_by_name(&plugins, "dup").unwrap();
+        assert_eq!(winner.dir.to_string_lossy(), "/plugins/b");
+        assert!(resolve_by_name(&plugins, "missing").is_none());
+    }
 
     #[test]
     fn parse_activation_onstartup() {

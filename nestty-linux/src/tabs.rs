@@ -1103,16 +1103,14 @@ impl TabManager {
             PanelVariant::Terminal(_) => ("utilities-terminal-symbolic".to_string(), "Terminal"),
             PanelVariant::WebView(_) => ("web-browser-symbolic".to_string(), "WebView"),
             PanelVariant::Plugin(pp) => {
-                let icon = pp.plugin_name.as_str();
-                // Look up icon from plugin manifest if available
-                let plugins = &self.plugins;
-                let icon_name = plugins
-                    .iter()
-                    .find(|p| p.manifest.plugin.name == pp.plugin_name)
-                    .and_then(|p| p.manifest.panels.iter().find(|pd| pd.name == pp.panel_name))
-                    .and_then(|pd| pd.icon.clone())
-                    .unwrap_or_else(|| "application-x-addon-symbolic".to_string());
-                let _ = icon;
+                // `resolve_by_name` honors the same duplicate-winner rule
+                // as daemon dispatch and `plugin.open`, so the tab icon
+                // matches the manifest those paths actually run.
+                let icon_name =
+                    nestty_core::plugin::resolve_by_name(&self.plugins, &pp.plugin_name)
+                        .and_then(|p| p.manifest.panels.iter().find(|pd| pd.name == pp.panel_name))
+                        .and_then(|pd| pd.icon.clone())
+                        .unwrap_or_else(|| "application-x-addon-symbolic".to_string());
                 (icon_name, "Plugin")
             }
         };
@@ -1604,8 +1602,16 @@ fn setup_tab_actions(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow)
     pop_box.append(&term_row);
     pop_box.append(&browser_row);
 
-    // Plugin entries
-    for plugin in manager.plugins.iter() {
+    // Plugin entries — keep only the winner per duplicate name so the
+    // picker matches what daemon dispatch / `plugin.open` would resolve.
+    let mut seen_names = std::collections::HashSet::new();
+    let plugin_winners: Vec<_> = manager
+        .plugins
+        .iter()
+        .rev()
+        .filter(|p| seen_names.insert(p.manifest.plugin.name.clone()))
+        .collect();
+    for plugin in plugin_winners.into_iter().rev() {
         for panel_def in &plugin.manifest.panels {
             let icon_name = panel_def
                 .icon
