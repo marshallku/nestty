@@ -40,6 +40,49 @@ pub fn socket_path() -> PathBuf {
     runtime_dir().join("socket")
 }
 
+/// Daemon socket from a GUI's perspective. Same as [`socket_path`] but with
+/// two extra guards:
+///
+/// 1. If `NESTTY_SOCKET` was injected by a parent nestty (to point a child
+///    shell's nestctl at the legacy per-instance socket
+///    `/tmp/nestty-{PID}.sock`), that's *not* the daemon — speaking the
+///    daemon wire protocol to it produces `unknown_method` for every Request.
+///    The legacy pattern is detected and falls through to the well-known path.
+/// 2. The well-known fallback (`runtime_dir()/socket`) requires its parent
+///    directory to pass [`is_trusted_dir`]. On systems without
+///    `XDG_RUNTIME_DIR` that parent is `/tmp/nestty-{uid}`, which an attacker
+///    can pre-create. Returns `None` so the caller refuses to attach to an
+///    untrusted daemon. An explicit `NESTTY_SOCKET` override (non-legacy) is
+///    treated as user-asserted trust — the user is responsible for that path.
+pub fn daemon_socket_path() -> Option<PathBuf> {
+    if let Ok(override_path) = env::var("NESTTY_SOCKET")
+        && !override_path.is_empty()
+    {
+        let p = PathBuf::from(override_path);
+        if !is_legacy_per_instance_socket(&p) {
+            return Some(p);
+        }
+        // Fall through to the well-known path.
+    }
+    let dir = runtime_dir();
+    if is_trusted_dir(&dir) {
+        Some(dir.join("socket"))
+    } else {
+        None
+    }
+}
+
+fn is_legacy_per_instance_socket(p: &std::path::Path) -> bool {
+    let s = p.to_string_lossy();
+    let Some(rest) = s.strip_prefix("/tmp/nestty-") else {
+        return false;
+    };
+    let Some(num) = rest.strip_suffix(".sock") else {
+        return false;
+    };
+    !num.is_empty() && num.chars().all(|c| c.is_ascii_digit())
+}
+
 /// Persistent state (handoffs, indices) — Linux `~/.local/state/nestty/`,
 /// macOS `~/Library/Application Support/nestty/`.
 pub fn state_dir() -> PathBuf {
@@ -116,10 +159,17 @@ pub fn is_trusted_dir(path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes env-mutating tests so they don't race under
+    /// `cargo test`'s default parallel runner.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn socket_path_respects_env_override() {
-        // SAFETY: env in tests is fine if no other thread reads it.
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: ENV_LOCK serializes our env-mutating tests; other tests
+        // in this module that read NESTTY_SOCKET take the same lock.
         unsafe {
             env::set_var("NESTTY_SOCKET", "/custom/path/sock");
         }
@@ -162,7 +212,65 @@ mod tests {
     }
 
     #[test]
+    fn daemon_socket_ignores_legacy_per_instance_pattern() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            env::set_var("NESTTY_SOCKET", "/tmp/nestty-3090.sock");
+        }
+        // Either Some(trusted-fallback) or None (untrusted runtime_dir).
+        // What matters: NEVER the legacy per-instance path.
+        let p = daemon_socket_path();
+        assert_ne!(p, Some(PathBuf::from("/tmp/nestty-3090.sock")));
+        unsafe {
+            env::remove_var("NESTTY_SOCKET");
+        }
+    }
+
+    #[test]
+    fn daemon_socket_honors_genuine_override() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            env::set_var("NESTTY_SOCKET", "/tmp/my-custom-daemon.sock");
+        }
+        let p = daemon_socket_path();
+        assert_eq!(p, Some(PathBuf::from("/tmp/my-custom-daemon.sock")));
+        unsafe {
+            env::remove_var("NESTTY_SOCKET");
+        }
+    }
+
+    #[test]
+    fn daemon_socket_returns_none_for_untrusted_runtime_dir() {
+        // Construct a 0755 dir and point XDG_RUNTIME_DIR at it so the
+        // fallback path roots there. is_trusted_dir rejects 0755, so
+        // daemon_socket_path must return None.
+        use std::os::unix::fs::PermissionsExt;
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "nestty-untrusted-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("loosen");
+        unsafe {
+            env::remove_var("NESTTY_SOCKET");
+            env::set_var("XDG_RUNTIME_DIR", &dir);
+        }
+        let p = daemon_socket_path();
+        unsafe {
+            env::remove_var("XDG_RUNTIME_DIR");
+        }
+        let _ = std::fs::remove_dir(&dir);
+        assert!(p.is_none(), "untrusted runtime dir must yield None");
+    }
+
+    #[test]
     fn paths_are_distinct() {
+        let _g = ENV_LOCK.lock().unwrap();
         unsafe {
             env::remove_var("NESTTY_SOCKET");
         }

@@ -2,7 +2,9 @@
 //! GUI capabilities via `gui.register`, and forwards inbound `Invoke`
 //! requests through the existing dispatch pump.
 //!
-//! Off by default. Enable with `NESTTY_DAEMON_CLIENT=1`.
+//! Always-on since Step 5a. The reconnect loop tolerates a missing
+//! daemon — backoff polls quietly while the GUI keeps running through
+//! its own in-process supervisor/socket.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -80,7 +82,20 @@ fn reconnect_loop(
 ) {
     let mut backoff = BACKOFF_INITIAL;
     loop {
-        let socket_path = nestty_core::paths::socket_path();
+        // daemon_socket_path (not socket_path) so a GUI launched from
+        // inside another nestty doesn't try to handshake the daemon
+        // protocol against the parent GUI's per-instance socket. Also
+        // returns None when the well-known runtime_dir is not owner-only,
+        // blocking the /tmp/nestty-{victim_uid} pre-creation attack.
+        let Some(socket_path) = nestty_core::paths::daemon_socket_path() else {
+            log::debug!(
+                "gui_client: daemon socket path untrusted (likely /tmp/nestty-{{uid}} not 0700-owner-only); sleeping {:?}",
+                backoff
+            );
+            thread::sleep(backoff);
+            backoff = (backoff * 2).min(BACKOFF_MAX);
+            continue;
+        };
         let registered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         match run(
             &socket_path.to_string_lossy(),
@@ -89,10 +104,14 @@ fn reconnect_loop(
             generation.clone(),
             registered.clone(),
         ) {
-            Ok(()) => eprintln!("[nestty] gui_client disconnected from daemon"),
-            Err(e) => eprintln!("[nestty] gui_client error: {e}"),
+            // log::debug so a daemon-never-starts run stays silent on
+            // stderr — the loop polls at most every 30s anyway, but a
+            // line per attempt would still be visible noise. Surface
+            // with RUST_LOG=debug if you need to see the cadence.
+            Ok(()) => log::debug!("gui_client disconnected from daemon"),
+            Err(e) => log::debug!("gui_client error: {e}"),
         }
-        eprintln!("[nestty] gui_client reconnect in {:?}", backoff);
+        log::debug!("gui_client reconnect in {:?}", backoff);
         thread::sleep(backoff);
         // Bump AFTER the sleep so the first retry waits BACKOFF_INITIAL,
         // not 2× it. Reset on success.

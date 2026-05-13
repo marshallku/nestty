@@ -17,6 +17,11 @@ mod window;
 // the shared transport types.
 
 fn main() {
+    // Default to `warn` so a no-daemon launch is silent on stderr;
+    // RUST_LOG=info / debug surfaces gui_client register/reconnect
+    // diagnostics and other log:: messages when needed.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--version" || a == "-V") {

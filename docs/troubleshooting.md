@@ -73,10 +73,9 @@ Multiple possible causes:
 **Cause:** GTK single-instance behavior. Another nestty instance already owns the GTK app ID `com.marshall.nestty`.
 **Fix:** `killall nestty` then relaunch.
 
-### env_logger output not visible
+### log:: messages not visible
 
-**Cause:** GTK may capture/redirect stderr. `RUST_LOG=info` has no visible effect.
-**Fix:** Use `eprintln!("[nestty] ...")` instead of `log::info!()` for debug output.
+**Cause (resolved Step 5a):** `nestty-linux` used to skip `env_logger::init()`, so `log::info!` / `log::warn!` were silent. We now initialize `env_logger` with `default_filter_or("warn")` in `main()`. Set `RUST_LOG=info` to surface gui_client register/reconnect, or `RUST_LOG=debug` for the full reconnect cadence. GTK does not capture stderr on console launches, so the diagnostics appear when running `nestty` from a terminal. Desktop-entry launches may still hide stderr depending on the session — use `journalctl --user -f` if needed.
 
 ### Terminal shows only one line (collapsed height)
 

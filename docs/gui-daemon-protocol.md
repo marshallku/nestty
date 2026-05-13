@@ -529,23 +529,26 @@ explicitly want to address a specific GUI (`--target_client_id`).
 
 ## Migration semantics
 
-During the transition (sequencing steps 4–5 in harness-integration.md), the
-GUI runs both paths under a feature flag:
+**Step 5a (current):** the GUI always starts `gui_client::spawn()` —
+no env-var gate. It opens a daemon-attached connection at startup and
+reconnects (1→30s backoff) whenever the daemon goes away. The
+in-process `socket::dispatch` path is still wired for the legacy
+nestctl-via-per-instance-socket flow; daemon→GUI Invokes route through
+the daemon path. Daemon-absent is benign: the reconnect loop polls
+quietly while the GUI runs entirely through its in-process supervisor.
 
-- **Flag off (current behavior):** socket goes to the in-process
-  `socket::dispatch`. GUI handlers invoked directly.
-- **Flag on (new behavior):** socket goes to the daemon. Daemon issues
-  `Invoke` to the GUI's daemon-connection. GUI handlers receive the same
-  function calls, just via the new path.
+**Step 5b (next, separate phase):** the in-process plugin supervisor
+inside nestty-linux is removed and the daemon becomes the sole plugin
+host. After this point the GUI cannot run plugins without a daemon
+attached. The standalone build feature in § Resolved decisions #3
+covers single-user no-systemd setups and CI by re-embedding the daemon
+in-process when compiled with `--features standalone`.
 
-Each handler is migrated one method at a time. When all GUI-owned methods
-(see § Routing rules for the precise subset of `LEGACY_DISPATCH_METHODS`) are
-flag-on, the *default* path switches to daemon-attached. The in-process path
-remains as a build-feature (`--features standalone`) per § Resolved decisions
-#3 — not deleted, just no longer the default.
-
-This lets us validate the protocol on real GUI commands without a flag day —
-a regression in `tab.new`'s new path doesn't break `webview.navigate`.
+Earlier sequencing steps (4a → 4b) migrated each GUI-owned method one
+at a time so a regression in one path didn't break the others. By the
+time Step 5a flipped the default-on switch, every method in
+§ Routing rules had been validated through the daemon path with real-
+GUI smoke runs (Phase 4b + 9.4 + 9.4.b verification).
 
 ## Resolved decisions
 

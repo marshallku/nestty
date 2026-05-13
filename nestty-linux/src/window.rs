@@ -250,15 +250,12 @@ impl NesttyWindow {
         let socket_path = format!("/tmp/nestty-{}.sock", std::process::id());
         let socket_rx = socket::start_server(&socket_path, event_bus.clone());
 
-        // Optional daemon-client mode: connect to nesttyd and serve
-        // GUI-owned Invokes through the same dispatch pump. Step 4a flag.
-        if std::env::var("NESTTY_DAEMON_CLIENT")
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false)
-        {
-            crate::gui_client::spawn(dispatch_tx.clone());
-            eprintln!("[nestty] NESTTY_DAEMON_CLIENT=1 — connecting to nesttyd");
-        }
+        // Always attempt to attach to nesttyd. Daemon-absent is fine:
+        // gui_client's reconnect_loop quietly polls (1→30s backoff) and
+        // the GUI runs fully through its own in-process supervisor/socket
+        // in the meantime. When a daemon eventually shows up, the GUI
+        // auto-registers and starts serving daemon→GUI Invokes too.
+        crate::gui_client::spawn(dispatch_tx.clone());
 
         let tab_manager = TabManager::new(
             config,

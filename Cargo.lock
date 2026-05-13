@@ -1682,6 +1682,7 @@ name = "nestty-linux"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "env_logger",
  "gtk4",
  "javascriptcore6",
  "libc",
