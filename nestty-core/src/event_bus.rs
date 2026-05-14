@@ -12,6 +12,14 @@ pub struct Event {
     pub source: String,
     pub timestamp_ms: u64,
     pub payload: Value,
+    /// Local-only marker — set when this event was lifted off a bridge
+    /// crossing (daemon→GUI or GUI→daemon) and re-published on the
+    /// destination bus. `#[serde(skip)]` keeps it out of every wire
+    /// frame so plugins/clients never see it. Forwarders skip events
+    /// with `Some(_)` so an event that already crossed once cannot
+    /// loop back through the other direction's forwarder.
+    #[serde(skip, default)]
+    pub bridge_id: Option<u64>,
 }
 
 impl Event {
@@ -21,7 +29,13 @@ impl Event {
             source: source.into(),
             timestamp_ms: now_millis(),
             payload,
+            bridge_id: None,
         }
+    }
+
+    pub fn with_bridge_id(mut self, id: u64) -> Self {
+        self.bridge_id = Some(id);
+        self
     }
 }
 
@@ -142,6 +156,15 @@ impl EventBus {
             sender: SubscriberSender::Unbounded(tx),
         });
         EventReceiver { inner: rx }
+    }
+
+    /// Publish an event whose `bridge_id` is already set by the caller.
+    /// Used by bridge-receive paths (daemon's `_bus.publish` handler and
+    /// the GUI's daemon-bridge reader) so the symmetric outgoing
+    /// forwarder can recognize this event as "already crossed once" and
+    /// not re-forward it.
+    pub fn publish_bridged(&self, event: Event, bridge_id: u64) {
+        self.publish(event.with_bridge_id(bridge_id));
     }
 
     pub fn publish(&self, event: Event) {
@@ -353,5 +376,35 @@ mod tests {
         let e = Event::new("x", "y", json!({}));
         let after = now_millis();
         assert!(e.timestamp_ms >= before && e.timestamp_ms <= after);
+    }
+
+    #[test]
+    fn fresh_event_has_no_bridge_id() {
+        let e = Event::new("x", "y", json!({}));
+        assert!(e.bridge_id.is_none());
+    }
+
+    #[test]
+    fn bridge_id_is_skipped_on_serialization() {
+        let e = Event::new("x", "y", json!({"k": "v"})).with_bridge_id(42);
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(
+            !json.contains("bridge_id"),
+            "bridge_id leaked to wire: {json}"
+        );
+        let back: Event = serde_json::from_str(&json).unwrap();
+        assert!(
+            back.bridge_id.is_none(),
+            "bridge_id must default to None on deserialization"
+        );
+    }
+
+    #[test]
+    fn publish_bridged_stamps_id_on_bus_subscriber() {
+        let bus = EventBus::new();
+        let rx = bus.subscribe_unbounded("*");
+        bus.publish_bridged(Event::new("x", "y", json!({})), 7);
+        let got = rx.try_recv().expect("event delivered");
+        assert_eq!(got.bridge_id, Some(7));
     }
 }
