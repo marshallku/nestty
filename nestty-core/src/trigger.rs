@@ -4,6 +4,9 @@
 //! - Triggers are declared declaratively in TOML / JSON as `[[triggers]]`.
 //! - `when` matches an event kind (glob) plus optional payload-field equality.
 //! - `params` may contain `{event.X}` / `{context.X}` interpolation tokens.
+//!   Payload keys (`event.<key>`) win; the top-level event fields
+//!   `kind`, `source`, `timestamp_ms` are the fallback so triggers can
+//!   reach event metadata without polluting plugin payloads.
 //! - Action invocations go through an `Arc<dyn TriggerSink>`. Default impl
 //!   on `ActionRegistry` gives synchronous error semantics for registered
 //!   actions. Platforms can plug a wider sink (e.g. `nestty-linux`'s
@@ -543,7 +546,7 @@ fn interpolate_value_typed(template: &Value, event: &Event, context: Option<&Con
             if let Some(token) = single_token(s)
                 && let Some(value) = resolve_token_value(token, event, context)
             {
-                return value.clone();
+                return value;
             }
             Value::String(interpolate_string(s, event, context))
         }
@@ -571,18 +574,28 @@ fn single_token(s: &str) -> Option<&str> {
     Some(inner)
 }
 
-fn resolve_token_value<'a>(
-    token: &str,
-    event: &'a Event,
-    context: Option<&'a Context>,
-) -> Option<&'a Value> {
+fn resolve_token_value(token: &str, event: &Event, context: Option<&Context>) -> Option<Value> {
     if let Some(field) = token.strip_prefix("event.") {
-        return resolve_dot_path(&event.payload, field);
+        if let Some(v) = resolve_dot_path(&event.payload, field) {
+            return Some(v.clone());
+        }
+        return event_top_level_value(field, event);
     }
-    // ContextService is two Option<String>s today; typed context resolution
-    // would need a richer surface. Fall back to string-coercion via the caller.
     let _ = context;
     None
+}
+
+/// Owned-`Value` view of the top-level `Event` fields that mirror the
+/// wire encoding (`kind`, `source`, `timestamp_ms`). Consulted only when
+/// `event.payload` lacks the requested key — payload wins so existing
+/// configs whose payload shadows these names keep their meaning.
+fn event_top_level_value(field: &str, event: &Event) -> Option<Value> {
+    match field {
+        "kind" => Some(Value::String(event.kind.clone())),
+        "source" => Some(Value::String(event.source.clone())),
+        "timestamp_ms" => Some(Value::Number(event.timestamp_ms.into())),
+        _ => None,
+    }
 }
 
 fn interpolate_string(s: &str, event: &Event, context: Option<&Context>) -> String {
@@ -616,7 +629,12 @@ fn interpolate_string(s: &str, event: &Event, context: Option<&Context>) -> Stri
 
 fn resolve_token(token: &str, event: &Event, context: Option<&Context>) -> Option<String> {
     if let Some(field) = token.strip_prefix("event.") {
-        return resolve_dot_path(&event.payload, field).map(json_scalar_to_string);
+        if let Some(v) = resolve_dot_path(&event.payload, field) {
+            return Some(json_scalar_to_string(v));
+        }
+        return event_top_level_value(field, event)
+            .as_ref()
+            .map(json_scalar_to_string);
     }
     if let Some(field) = token.strip_prefix("context.") {
         let ctx = context?;
@@ -861,6 +879,61 @@ mod tests {
         assert_eq!(result["b"], json!("{unknown}"));
         assert_eq!(result["c"], json!("no braces"));
         assert_eq!(result["d"], json!("unclosed {brace"));
+    }
+
+    #[test]
+    fn interpolates_event_top_level_fields() {
+        let t = Trigger {
+            name: "t".into(),
+            when: WhenSpec {
+                event_kind: "*".into(),
+                payload_match: Map::new(),
+            },
+            action: "noop".into(),
+            params: json!({
+                "k": "{event.kind}",
+                "s": "{event.source}",
+                "t": "{event.timestamp_ms}",
+            }),
+            condition: None,
+            r#await: None,
+        };
+        let event = Event::new("plugin.hello.done", "plugin.hello", json!({}));
+        let stamp = event.timestamp_ms;
+        let result = t.interpolate(&event, None);
+        assert_eq!(result["k"], json!("plugin.hello.done"));
+        assert_eq!(result["s"], json!("plugin.hello"));
+        assert_eq!(result["t"], json!(stamp.to_string()));
+    }
+
+    #[test]
+    fn payload_key_shadows_event_top_level_field() {
+        let t = Trigger {
+            name: "t".into(),
+            when: WhenSpec {
+                event_kind: "*".into(),
+                payload_match: Map::new(),
+            },
+            action: "noop".into(),
+            params: json!({"s": "{event.source}"}),
+            condition: None,
+            r#await: None,
+        };
+        let result = t.interpolate(
+            &Event::new("k", "real-source", json!({"source": "payload-source"})),
+            None,
+        );
+        assert_eq!(result["s"], json!("payload-source"));
+    }
+
+    #[test]
+    fn typed_interpolation_preserves_timestamp_ms_as_number() {
+        let event = Event::new("k", "src", json!({}));
+        let stamp = event.timestamp_ms;
+        let template = json!({"ts": "{event.timestamp_ms}"});
+        let result = interpolate_value_typed(&template, &event, None);
+        assert_eq!(result["ts"], json!(stamp));
+        assert!(result["ts"].is_number(), "want Number, got {result}");
     }
 
     #[test]

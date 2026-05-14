@@ -305,7 +305,9 @@ name = "catppuccin-mocha"
 # [[triggers]]
 # name = "log-cwd"
 # action = "system.log"
-# params = { message = "cwd: {event.cwd}" }
+# # Interpolation tokens: {event.<payload-key>} reaches into the event's
+# # JSON payload; if missing there, falls back to {event.kind|source|timestamp_ms}.
+# params = { message = "[{event.timestamp_ms}] cwd: {event.cwd}" }
 # [triggers.when]
 # event_kind = "terminal.cwd_changed"
 "##;
