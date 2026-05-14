@@ -243,3 +243,27 @@ The GUI's outgoing forwarder is **gated on `host_triggers=true`** in the daemon'
 The watcher running even when `host_triggers=false` is intentional: a future Stage D could turn `host_triggers` into a runtime toggle (e.g. on a daemon mode switch) and the watcher already has the engine state ready.
 
 **See:** `nestty-linux/src/window.rs` (`apply_host_triggers`, `drain_to_latest`, `watch_config` skip gate, 50 ms timer cut-over consumer), `nestty-linux/src/gui_client.rs` (`HostTriggersGuard`), `nestty-daemon/src/main.rs` (`config_watcher_loop`, `apply_reloaded_triggers`, `build_pump_state`), and e2e step 10 in `scripts/e2e-daemon-client.sh`.
+
+## 23. `events.publish` Public Surface + `SO_PEERCRED` Source Stamping (Step 5b.2 Stage D)
+
+**Problem:** Headless `nesttyd` runs need a way for external scripts to fire events onto the daemon bus — without that, the entire trigger engine relocation (Stages A-C) has no headless entrypoint. The first instinct was to expose the bus through the existing `ActionRegistry` (e.g., add a `publish` action), but two rounds of codex-plan revealed the wider trust gaps that approach opens.
+
+**Decision:** `events.publish` is a **wire-only** socket method (special-cased in `handle_connection` before generic `dispatch`). NOT in `ActionRegistry`. Three concrete reasons:
+
+1. Generic socket clients can call any registry method via raw `Request { method }`. If `events.publish` were in the registry, every connection-level trust gate (the registered-GUI convention, the future per-method ACL) would be a fiction — the registry routes by name without inspecting the connection.
+2. Every registry-routed action auto-publishes `<name>.completed` / `.failed` events. For `events.publish` that would mean a synthetic completion fan-out for every external event — polluting the bus with metadata about the metadata.
+3. Trust gates live at the connection layer (peer credentials, registered-GUI flag), which the registry's method-match path has no visibility into.
+
+The public surface accepts `{ kind: String, payload?: Value }` and **daemon-controls `source` and `timestamp_ms`**. `source = format!("client.{pid}")` is stamped via `SO_PEERCRED` on Linux; non-Linux returns `None` → `"client.unknown"`. `timestamp_ms` is filled by `BusEvent::new` from the daemon clock. The caller has no way to set either field. This is what makes spoofing the action-registry completion gate impossible: `try_promote_or_drop_preflight` reads top-level `source` and trusts only `nestty.action`. Since `events.publish` cannot ever produce that top-level value, no chained workflow can be hijacked.
+
+`_bus.publish` (Stage B) and `events.publish` (Stage D) are two separate methods, not one with a registered-GUI branch. The split avoids a complex "if registered, trust the source field, else stamp it" branch with subtle trust gaps:
+- `_bus.publish` = bridge variant (registered GUI relays its own events, source/timestamp from caller, `bridge_id` set to prevent echo).
+- `events.publish` = public variant (no registration, daemon stamps source/timestamp, no `bridge_id`).
+
+`nestctl event publish <kind> [json-payload]` uses `paths::daemon_socket_path()` directly, bypassing `discover_socket`'s GUI-first preference. Connecting to a GUI socket would return `unknown_method`. The publish subcommand also parses the payload locally before opening the socket so malformed JSON fails with a clear `invalid_argument` instead of being forwarded as a confusing daemon-side error.
+
+**Tradeoff:** `SO_PEERCRED` returns the peer's pid at connect time, not call time. Pid reuse across process death (bounded by Linux's `kernel.pid_max`) could briefly misattribute the source — acceptable for the log-correlation use case. macOS uses `LOCAL_PEERCRED` and would need its own plumbing; for now the macOS daemon stub returns `None` and source becomes `"client.unknown"`. No rate-limiting on `events.publish` — same trust band as today's `nestctl call`, where 0600 socket reachability is the only guard. Documented as known; rate-limit is a follow-up. Payload size cap (64 KiB) was considered but deferred: the daemon's `reader.lines()` has no upper bound regardless, so a cap at the application layer wouldn't meaningfully protect daemon memory. Line-size hardening is a separate commit.
+
+The decision to leave trigger condition / interpolation reading payload-source first (an existing pre-Stage-D semantic, preserved) is a user-config concern: if a trigger author writes `condition = "event.source == 'foo'"`, they're reading payload, not provenance. The daemon's trust gates (`try_promote_or_drop_preflight`) operate on top-level fields, which the daemon controls; user-defined conditions on `event.source` would need to verify payload absence to gate on daemon-controlled provenance. Documented in the user-facing trigger config docs (forthcoming).
+
+**See:** `nestty-daemon/src/socket.rs` (`peer_pid`, `handle_events_publish`), `nestty-cli/src/commands.rs` + `nestty-cli/src/main.rs` (`EventCommand::Publish`, `dispatch_publish`), and e2e step 11 in `scripts/e2e-daemon-client.sh`.

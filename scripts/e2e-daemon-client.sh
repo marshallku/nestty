@@ -15,8 +15,10 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DAEMON="$REPO/target/debug/nesttyd"
+NESTCTL="$REPO/target/debug/nestctl"
 
 [[ -x "$DAEMON" ]] || { echo "build first: cargo build -p nestty-daemon"; exit 2; }
+[[ -x "$NESTCTL" ]] || { echo "build first: cargo build -p nestty-cli"; exit 2; }
 
 WORK="$(mktemp -d -t nestty-e2e.XXXXXX)"
 DAEMON_LOG="$WORK/daemon.log"
@@ -622,6 +624,48 @@ while (( SECONDS < fire_deadline )); do
 done
 (( fired == 1 )) || fail "daemon's TriggerEngine did not dispatch the bridged event (system.log line absent)"
 pass "daemon dispatched bridged e2e.cutover → system.log fired"
+
+step 11 "nestctl event publish fires daemon trigger end-to-end"
+# Rewrite the trigger config so the new e2e.publish kind matches a
+# fresh `system.log` action. The daemon's 2s mtime watcher picks up
+# the change without restart. Then nestctl event publish from a
+# separate shell process fires the trigger; daemon dispatches the
+# trigger and emits the configured system.log to stderr.
+cat > "$XDG_CONFIG_HOME/nestty/config.toml" <<'TOML'
+[[triggers]]
+name = "e2e-publish"
+action = "system.log"
+params = { message = "e2e-publish-fired" }
+[triggers.when]
+event_kind = "e2e.publish"
+TOML
+
+# Watcher tick is 2s; allow a couple ticks for the file mtime to
+# overtake the prior config write.
+wait_for_count 'trigger config reloaded' "$DAEMON_LOG" 1 8 \
+    || fail "daemon's config watcher did not pick up the new trigger config"
+
+PUBLISH_LOG_OFFSET=$(wc -c < "$DAEMON_LOG")
+PUBLISH_OUT=$("$NESTCTL" event publish e2e.publish '{"hello": "world"}' 2>&1)
+echo "[nestctl publish output] $PUBLISH_OUT"
+echo "$PUBLISH_OUT" | grep -q 'queued' \
+    || fail "nestctl event publish did not return queued: got $PUBLISH_OUT"
+pass "nestctl event publish returned queued"
+
+# Verify the daemon dispatched the trigger via the watcher-reloaded
+# config. Offset-based grep so prior steps' system.log lines don't
+# false-match.
+fire_deadline=$(( SECONDS + 5 ))
+fired=0
+while (( SECONDS < fire_deadline )); do
+    if dd if="$DAEMON_LOG" bs=1 skip="$PUBLISH_LOG_OFFSET" 2>/dev/null \
+        | grep -q '\[system\.log\] e2e-publish-fired'; then
+        fired=1; break
+    fi
+    sleep 0.2
+done
+(( fired == 1 )) || fail "daemon did not dispatch the nestctl-published trigger (system.log line absent)"
+pass "daemon dispatched nestctl-published e2e.publish → system.log fired"
 
 echo
 echo "=== AUTO E2E COMPLETE ==="
