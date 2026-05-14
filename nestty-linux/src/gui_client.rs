@@ -6,12 +6,12 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::thread;
 use std::time::Duration;
 
-use nestty_core::event_bus::{Event as BusEvent, EventBus, next_bridge_id};
+use nestty_core::event_bus::{Event as BusEvent, EventBus, RecvOutcome, next_bridge_id};
 use nestty_core::protocol::{Event as WireEvent, Invoke, Request, Response};
 use nestty_core::thread_pool::Cancelable;
 use serde_json::Value;
@@ -19,6 +19,31 @@ use serde_json::Value;
 use crate::socket::SocketCommand;
 
 const PROTOCOL_VERSION: u32 = nestty_core::protocol::PROTOCOL_VERSION;
+
+/// GUI bus → daemon bus forwarder kind list. Only events relevant to
+/// daemon-side triggers / context cross the bridge; `terminal.output`
+/// is excluded because it fires per-keystroke and would saturate the
+/// wire without any trigger-facing value.
+const GUI_TO_DAEMON_FORWARD_KINDS: &[&str] = &[
+    "panel.exited",
+    "panel.focused",
+    "panel.title_changed",
+    "tab.closed",
+    "tab.created",
+    "tab.renamed",
+    "terminal.cwd_changed",
+    "terminal.shell_precmd",
+    "terminal.shell_preexec",
+    "webview.loaded",
+    "webview.navigated",
+    "webview.title_changed",
+    "window.restored",
+];
+
+/// How often each forwarder thread checks the shutdown flag when no
+/// matching events have arrived. 100 ms is responsive enough for
+/// reconnect (~3 cycles per backoff tick) without burning CPU.
+const FORWARDER_POLL: Duration = Duration::from_millis(100);
 
 /// Workers spend most of their time waiting on the GTK reply channel,
 /// so the cap is concurrency-limiting, not throughput-tuning.
@@ -140,8 +165,19 @@ fn run(
 
     let mut reader = BufReader::new(stream);
     let register_id = register(&writer_tx)?;
-    await_register_ack(&mut reader, &register_id)?;
+    let ack = await_register_ack(&mut reader, &register_id)?;
     registered.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // Daemon advertises whether IT will dispatch triggers. If true,
+    // start the GUI→daemon event forwarder so the daemon's engine
+    // sees GUI-published events. Otherwise the GUI's local engine
+    // remains authoritative (Stage A semantics) and the forwarder
+    // stays dormant.
+    let forwarder_stop = Arc::new(AtomicBool::new(false));
+    let _forwarder_guard = ForwarderGuard(forwarder_stop.clone());
+    if ack.host_triggers {
+        start_gui_event_forwarder(event_bus.clone(), writer_tx.clone(), forwarder_stop.clone());
+    }
 
     for line in reader.lines() {
         let line = line.map_err(|e| format!("read: {e}"))?;
@@ -202,6 +238,92 @@ fn run(
     Ok(())
 }
 
+/// Drop-guard for the forwarder shutdown flag. Mirrors the existing
+/// `GenGuard` pattern: flips the AtomicBool on every `run()` exit
+/// (success OR error), guaranteeing the spawned forwarder threads
+/// observe it within one [`FORWARDER_POLL`] interval and exit. The
+/// per-kind `subscribe_unbounded` receivers drop when the threads
+/// exit, breaking the bus subscription cleanly.
+struct ForwarderGuard(Arc<AtomicBool>);
+
+impl Drop for ForwarderGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Spawn one thread per [`GUI_TO_DAEMON_FORWARD_KINDS`] entry. Each
+/// thread subscribes unbounded to its kind and forwards GUI-native
+/// (non-bridged) events to the daemon via `_bus.publish` Request
+/// frames on `writer_tx`. Bridged events (those that crossed the
+/// daemon→GUI bridge) are skipped via the `bridge_id` check, so the
+/// loop is broken on the GUI side.
+fn start_gui_event_forwarder(
+    event_bus: Arc<EventBus>,
+    writer_tx: Sender<String>,
+    stop: Arc<AtomicBool>,
+) {
+    for kind in GUI_TO_DAEMON_FORWARD_KINDS {
+        let rx = event_bus.subscribe_unbounded(*kind);
+        let writer_tx = writer_tx.clone();
+        let stop = stop.clone();
+        let kind = (*kind).to_string();
+        let thread_name = format!("nestty-gui-forwarder-{}", kind.replace('.', "-"));
+        if let Err(e) = thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || gui_forwarder_loop(kind, rx, writer_tx, stop))
+        {
+            log::warn!("[nestty] gui_client: failed to spawn forwarder thread: {e}");
+        }
+    }
+}
+
+fn gui_forwarder_loop(
+    kind: String,
+    rx: nestty_core::event_bus::EventReceiver,
+    writer_tx: Sender<String>,
+    stop: Arc<AtomicBool>,
+) {
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        match rx.recv_timeout(FORWARDER_POLL) {
+            RecvOutcome::Event(ev) => {
+                if ev.bridge_id.is_some() {
+                    // Came in via the daemon→GUI bridge — already
+                    // crossed once, do not echo back.
+                    continue;
+                }
+                let req = Request::new(
+                    uuid::Uuid::new_v4().to_string(),
+                    "_bus.publish",
+                    serde_json::json!({
+                        "kind": ev.kind,
+                        "source": ev.source,
+                        "timestamp_ms": ev.timestamp_ms,
+                        "payload": ev.payload,
+                    }),
+                );
+                let line = match serde_json::to_string(&req) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("[nestty] forwarder({kind}) serialize: {e}");
+                        continue;
+                    }
+                };
+                if writer_tx.send(line).is_err() {
+                    // Writer thread exited (stream closed) — nothing
+                    // more we can do; let the receiver drop on exit.
+                    return;
+                }
+            }
+            RecvOutcome::Timeout => continue,
+            RecvOutcome::Disconnected => return,
+        }
+    }
+}
+
 fn register(writer_tx: &Sender<String>) -> Result<String, String> {
     let window_id = uuid::Uuid::new_v4().to_string();
     let req_id = uuid::Uuid::new_v4().to_string();
@@ -223,7 +345,19 @@ fn register(writer_tx: &Sender<String>) -> Result<String, String> {
     Ok(req_id)
 }
 
-fn await_register_ack(reader: &mut BufReader<UnixStream>, register_id: &str) -> Result<(), String> {
+/// Captured fields from the daemon's `gui.register` success ack.
+/// Today only `host_triggers` flows back to the caller; future
+/// fields (negotiated protocol version, daemon-advertised
+/// capabilities) would join here.
+#[derive(Debug, Clone, Default)]
+struct RegisterAck {
+    host_triggers: bool,
+}
+
+fn await_register_ack(
+    reader: &mut BufReader<UnixStream>,
+    register_id: &str,
+) -> Result<RegisterAck, String> {
     let mut line = String::new();
     if reader
         .read_line(&mut line)
@@ -247,11 +381,13 @@ fn await_register_ack(reader: &mut BufReader<UnixStream>, register_id: &str) -> 
         });
         return Err(format!("register rejected: {} {}", err.code, err.message));
     }
-    log::info!(
-        "[nestty] gui_client registered with nesttyd: {}",
-        resp.result.unwrap_or_default()
-    );
-    Ok(())
+    let result = resp.result.unwrap_or_default();
+    let host_triggers = result
+        .get("host_triggers")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    log::info!("[nestty] gui_client registered with nesttyd: {result}");
+    Ok(RegisterAck { host_triggers })
 }
 
 fn handle_ping(value: Value, writer_tx: &Sender<String>) -> Result<(), String> {
@@ -445,6 +581,66 @@ mod tests {
         let resp: Response = serde_json::from_str(&line).unwrap();
         assert_eq!(resp.id, "");
         assert_eq!(resp.error.unwrap().code, "overloaded");
+    }
+
+    #[test]
+    fn forwarder_emits_bus_publish_for_native_event() {
+        let bus = Arc::new(EventBus::new());
+        let (writer_tx, writer_rx) = channel::<String>();
+        let stop = Arc::new(AtomicBool::new(false));
+        start_gui_event_forwarder(bus.clone(), writer_tx, stop.clone());
+        // Give the per-kind subscriber threads a tick to enter
+        // recv_timeout before we publish.
+        thread::sleep(Duration::from_millis(50));
+        bus.publish(BusEvent::new(
+            "panel.focused",
+            "test",
+            json!({ "panel_id": "p1" }),
+        ));
+        let line = writer_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("forwarder should emit _bus.publish");
+        let req: Request = serde_json::from_str(&line).unwrap();
+        assert_eq!(req.method, "_bus.publish");
+        assert_eq!(req.params["kind"], json!("panel.focused"));
+        assert_eq!(req.params["source"], json!("test"));
+        assert_eq!(req.params["payload"]["panel_id"], json!("p1"));
+        stop.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn forwarder_skips_bridged_event() {
+        let bus = Arc::new(EventBus::new());
+        let (writer_tx, writer_rx) = channel::<String>();
+        let stop = Arc::new(AtomicBool::new(false));
+        start_gui_event_forwarder(bus.clone(), writer_tx, stop.clone());
+        thread::sleep(Duration::from_millis(50));
+        // Publish a BRIDGED event — forwarder must skip.
+        bus.publish_bridged(BusEvent::new("panel.focused", "daemon-side", json!({})), 99);
+        // 200ms backstop — no Request should appear.
+        match writer_rx.recv_timeout(Duration::from_millis(200)) {
+            Err(_) => {}
+            Ok(line) => panic!("forwarder leaked bridged event: {line}"),
+        }
+        // Sanity: a native event DOES flow.
+        bus.publish(BusEvent::new("panel.focused", "test", json!({})));
+        writer_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("native event should flow");
+        stop.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn forwarder_guard_flips_stop_on_drop() {
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let _g = ForwarderGuard(stop.clone());
+            assert!(!stop.load(Ordering::SeqCst));
+        }
+        assert!(
+            stop.load(Ordering::SeqCst),
+            "ForwarderGuard must flip stop on drop"
+        );
     }
 
     #[test]
