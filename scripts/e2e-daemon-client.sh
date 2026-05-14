@@ -516,6 +516,113 @@ ctrl_seen=$(python3 -c "import sys,json; print(json.loads(sys.argv[1])['saw_posi
 [[ "$ctrl_seen" == "True" ]] || fail "positive control: daemon-native completion didn't reach the GUI; can't trust the echo-absence above"
 pass "positive control: __test.slow_blocking.completed delivered (forwarder alive)"
 
+step 10 "host_triggers=true cut-over → daemon dispatches trigger from bridged event"
+# Tear down the running daemon and restart it with NESTTYD_HOST_TRIGGERS=1
+# plus a config.toml containing a `[[trigger]]` that listens on a
+# synthetic kind and fires `system.log`. A registered mock GUI then
+# pushes the matching event via `_bus.publish`; the daemon's
+# TriggerEngine consumes it (via the pump thread that's now running)
+# and the configured system.log emits to daemon stderr.
+kill -TERM "$DAEMON_PID" 2>/dev/null || true
+wait "$DAEMON_PID" 2>/dev/null || true
+DAEMON_PID=""
+
+mkdir -p "$XDG_CONFIG_HOME/nestty"
+cat > "$XDG_CONFIG_HOME/nestty/config.toml" <<'TOML'
+[[triggers]]
+name = "e2e-cutover"
+action = "system.log"
+params = { message = "e2e-cutover-fired" }
+[triggers.when]
+event_kind = "e2e.cutover"
+TOML
+
+# Record the daemon log size BEFORE the restart so the assertion can
+# isolate the new run's stderr from prior step output.
+DAEMON_LOG_OFFSET=$(wc -c < "$DAEMON_LOG")
+
+NESTTYD_HOST_TRIGGERS=1 "$DAEMON" >>"$DAEMON_LOG" 2>&1 &
+DAEMON_PID=$!
+DAEMON_STARTS=$(( DAEMON_STARTS + 1 ))
+wait_for_count 'nesttyd listening on' "$DAEMON_LOG" "$DAEMON_STARTS" 5 \
+    || fail "daemon did not restart with NESTTYD_HOST_TRIGGERS=1"
+wait_for 'trigger engine: 1 configured' "$DAEMON_LOG" 5 \
+    || fail "daemon did not load the cut-over trigger config"
+wait_for 'dispatch=ON' "$DAEMON_LOG" 2 \
+    || fail "daemon did not log dispatch=ON for host_triggers=1"
+
+CUTOVER_LOG="$WORK/cutover.log"
+python3 - "$SOCKET" >"$CUTOVER_LOG" 2>&1 <<'PY'
+import json, socket, sys, uuid
+
+sock_path = sys.argv[1]
+
+def read_response(f, target_id, timeout=2.0):
+    # A registered GUI socket interleaves async Event frames (from the
+    # daemon's auto-subscribe-all forwarder) with RPC responses. Read
+    # lines until we find the response with the expected id; skip
+    # everything else.
+    import select, time
+    deadline = time.monotonic() + timeout
+    sock = f.raw if hasattr(f, "raw") else None
+    while time.monotonic() < deadline:
+        line = f.readline()
+        if not line:
+            return None
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if msg.get("id") == target_id and "ok" in msg:
+            return msg
+    return None
+
+gui = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+gui.connect(sock_path)
+gui.settimeout(2.0)
+f = gui.makefile("rwb", buffering=0)
+reg_id = str(uuid.uuid4())
+reg = {"id": reg_id, "method": "gui.register",
+       "params": {"window_id": str(uuid.uuid4()),
+                  "capabilities": ["tab"],
+                  "want_primary": True, "protocol_version": 1}}
+f.write((json.dumps(reg) + "\n").encode())
+reg_resp = read_response(f, reg_id)
+pub_id = str(uuid.uuid4())
+pub = {"id": pub_id, "method": "_bus.publish",
+       "params": {"kind": "e2e.cutover", "source": "e2e-mock",
+                  "timestamp_ms": 1, "payload": {}}}
+f.write((json.dumps(pub) + "\n").encode())
+pub_resp = read_response(f, pub_id)
+gui.close()
+print(json.dumps({
+    "host_triggers_advertised": (reg_resp or {}).get("result", {}).get("host_triggers"),
+    "publish_ok": (pub_resp or {}).get("ok"),
+}))
+PY
+C_SUMMARY=$(tail -n1 "$CUTOVER_LOG")
+ht_ack=$(python3 -c "import sys,json; print(json.loads(sys.argv[1])['host_triggers_advertised'])" "$C_SUMMARY")
+[[ "$ht_ack" == "True" ]] || fail "register ack with NESTTYD_HOST_TRIGGERS=1 didn't return host_triggers=true (got $ht_ack)"
+pass "register ack advertises host_triggers=true under NESTTYD_HOST_TRIGGERS=1"
+
+pub_ok=$(python3 -c "import sys,json; print(json.loads(sys.argv[1])['publish_ok'])" "$C_SUMMARY")
+[[ "$pub_ok" == "True" ]] || fail "_bus.publish: expected ok=true, got $pub_ok"
+
+# Poll daemon stderr for the trigger's system.log output, considering
+# only bytes WRITTEN AFTER the restart. The configured params.message
+# is "e2e-cutover-fired"; system.log emits "[system.log] <message>".
+fire_deadline=$(( SECONDS + 5 ))
+fired=0
+while (( SECONDS < fire_deadline )); do
+    if dd if="$DAEMON_LOG" bs=1 skip="$DAEMON_LOG_OFFSET" 2>/dev/null \
+        | grep -q '\[system\.log\] e2e-cutover-fired'; then
+        fired=1; break
+    fi
+    sleep 0.2
+done
+(( fired == 1 )) || fail "daemon's TriggerEngine did not dispatch the bridged event (system.log line absent)"
+pass "daemon dispatched bridged e2e.cutover → system.log fired"
+
 echo
 echo "=== AUTO E2E COMPLETE ==="
 echo

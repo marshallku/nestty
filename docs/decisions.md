@@ -213,3 +213,33 @@ The GUI's outgoing forwarder is **gated on `host_triggers=true`** in the daemon'
 **Tradeoff:** A per-process counter means a stale event observed across a daemon restart could collide (each daemon starts at 1). Not a real concern because bridge crossings are session-scoped — neither side retains stale events past a disconnect. Tracking the id on every `Event` clone costs ~16 bytes per event; trivial. Stage B intentionally defers the GUI-engine clear (cut-over) to Stage C — Stage B alone with `NESTTYD_HOST_TRIGGERS=1` double-fires (both engines dispatch), documented as known limitation under an opt-in env flag.
 
 **See:** `nestty-core/src/event_bus.rs` (`next_bridge_id`, `publish_bridged`, `Event::bridge_id`), `nestty-daemon/src/socket.rs` (`handle_bus_publish`, `DaemonState.host_triggers`), `nestty-daemon/src/gui_registry.rs` (`forwarder_loop` echo gate), `nestty-linux/src/gui_client.rs` (`start_gui_event_forwarder` + `ForwarderGuard`), and e2e step 9 in `scripts/e2e-daemon-client.sh`.
+
+## 22. Atomic Cut-Over and Daemon Config Watcher (Step 5b.2 Stage C)
+
+**Problem:** Stage B left a documented double-fire under `NESTTYD_HOST_TRIGGERS=1` — the GUI's local TriggerEngine kept dispatching alongside the daemon's. Stage C resolves the cut-over without leaving recovery gaps. Two independent requirements:
+
+1. When the daemon advertises `host_triggers=true` in `gui.register`, the GUI must empty its local engine atomically AND refuse later `watch_config` reloads (which would re-arm it). When the daemon crashes mid-session, the GUI must restore local authority before the reconnect backoff begins — otherwise events fire with no subscriber.
+2. The daemon's own engine needs runtime config tracking even with no GUI attached (headless `nesttyd`). A user editing `~/.config/nestty/config.toml` should see the change take effect without restarting the daemon.
+
+**Decision (cut-over):** Three round-by-round codex critiques narrowed the design to:
+
+- A `mpsc::channel::<bool>()` from `gui_client::run` to the GTK 50 ms timer. On register-ack success the run sends `ack.host_triggers`. A `HostTriggersGuard` drop guard mirrors `ForwarderGuard`'s pattern and sends `false` on every `run()` exit (success or error), restoring local authority on daemon disconnect.
+- The 50 ms timer's cut-over consumer runs **BEFORE** `pump_all` so a queued `true` clears the engine on the SAME tick rather than letting one more dispatch through.
+- The consumer is **edge-triggered**: it only applies when the queued value differs from the last applied state (`Cell<bool>` per-closure). Otherwise every normal reconnect with `host_triggers=false` would call `set_triggers(cached)` and reset preflight/pending await state — same hazard as today's hot-reload but fired on a connection bounce.
+- A persistent `Arc<AtomicBool> host_triggers_active` is the source of truth. `watch_config` consults it: when `true`, the disk-reload still updates `cached_triggers` (so a later disconnect restores the FRESHEST config, not the startup snapshot) but skips `set_triggers` + `reconcile_triggers` for the triggers field. Theme, statusbar, background, keybindings still reload normally.
+- The `start_gui_event_forwarder` (Stage B) is started **BEFORE** the cut-over signal is sent (codex round-1 C1). Otherwise the GTK timer could clear local subscriptions while the forwarder hasn't subscribed yet, leaving an event-loss window where neither engine fires.
+- Tradeoff: `set_triggers` clears in-flight await state on every transition. Documented as acceptable — same as today's hot-reload semantics; trigger configs at personal scale rarely run long chains across reconnect events.
+- Post-disconnect window (≤ 50 ms between `Drop` sending `false` and the timer applying it) where the local engine is still empty AND the daemon is gone — events in that window fire with no subscriber. Negligible in practice; only relevant if the daemon crashes mid-session under `NESTTYD_HOST_TRIGGERS=1`.
+
+**Decision (watcher):** Daemon-side config watcher is a 2 s mtime poll thread spawned in `main()`, always running regardless of `host_triggers`:
+
+- `load_triggers_config()` captures the file mtime at the same instant as the initial load and passes it to the watcher. Without that, an edit landing between `main()`'s load and the watcher's first tick would be silently treated as the baseline (codex round-2 C1).
+- `apply_reloaded_triggers` mirrors the GUI's `watch_config` ordering when host_triggers=true: `engine.set_triggers(new)` → `pump_state.pump_all(ctx, engine)` on OLD subscribers (flush pending events into the soon-to-be-replaced set) → `pump_state.reconcile_triggers(bus, &new)`. Skipping `pump_all` would discard pending events the new trigger set would have matched during a pattern-narrowing reload.
+- When host_triggers=false, **no PumpState exists** (codex round-3 C1 — extended scrutiny uncovered a pre-existing Stage A bug). The watcher only updates `engine.set_triggers` and refreshes `cached_triggers`; no `reconcile_triggers` means no `subscribe_unbounded` receivers are created with nothing to drain them, so the daemon bus doesn't accumulate events under the default daemon configuration.
+- `notify` crate dep rejected; 2 s mtime poll is enough for trigger reloads and avoids the wider compat surface.
+
+**Tradeoff:** Tying the cut-over to the daemon's register-ack advertisement means each disconnect/reconnect re-traverses the cut-over → restore cycle. Each transition costs one `set_triggers` (clears preflight/pending await state). Users running long-chain workflows during daemon flap would lose those workflows. Accepted because (a) personal-scale trigger configs are short, (b) the daemon flap itself is the more pressing fault and would already break in-flight workflows for other reasons (forwarded events stop arriving), (c) the alternative — preserve await state across cut-over — adds significant state-machine complexity.
+
+The watcher running even when `host_triggers=false` is intentional: a future Stage D could turn `host_triggers` into a runtime toggle (e.g. on a daemon mode switch) and the watcher already has the engine state ready.
+
+**See:** `nestty-linux/src/window.rs` (`apply_host_triggers`, `drain_to_latest`, `watch_config` skip gate, 50 ms timer cut-over consumer), `nestty-linux/src/gui_client.rs` (`HostTriggersGuard`), `nestty-daemon/src/main.rs` (`config_watcher_loop`, `apply_reloaded_triggers`, `build_pump_state`), and e2e step 10 in `scripts/e2e-daemon-client.sh`.
