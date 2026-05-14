@@ -66,7 +66,11 @@ const CAPABILITIES: &[&str] = &[
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
-pub fn spawn(dispatch_tx: Sender<SocketCommand>, event_bus: Arc<EventBus>) {
+pub fn spawn(
+    dispatch_tx: Sender<SocketCommand>,
+    event_bus: Arc<EventBus>,
+    host_triggers_tx: Sender<bool>,
+) {
     thread::Builder::new()
         .name("nestty-gui-client".into())
         .spawn(move || {
@@ -76,7 +80,7 @@ pub fn spawn(dispatch_tx: Sender<SocketCommand>, event_bus: Arc<EventBus>) {
             // connection so they bail out before mutating GTK state.
             let pool = nestty_core::thread_pool::ThreadPool::new(POOL_WORKERS, POOL_QUEUE);
             let generation = Arc::new(AtomicU64::new(0));
-            reconnect_loop(dispatch_tx, pool, generation, event_bus);
+            reconnect_loop(dispatch_tx, pool, generation, event_bus, host_triggers_tx);
         })
         .expect("spawn nestty-gui-client");
 }
@@ -86,6 +90,7 @@ fn reconnect_loop(
     pool: std::sync::Arc<nestty_core::thread_pool::ThreadPool>,
     generation: Arc<AtomicU64>,
     event_bus: Arc<EventBus>,
+    host_triggers_tx: Sender<bool>,
 ) {
     let mut backoff = BACKOFF_INITIAL;
     loop {
@@ -108,6 +113,7 @@ fn reconnect_loop(
             generation.clone(),
             registered.clone(),
             event_bus.clone(),
+            host_triggers_tx.clone(),
         ) {
             // log::debug so a daemon-never-starts run stays silent on
             // stderr — the loop polls at most every 30s anyway, but a
@@ -135,6 +141,7 @@ fn run(
     generation: Arc<AtomicU64>,
     registered: std::sync::Arc<std::sync::atomic::AtomicBool>,
     event_bus: Arc<EventBus>,
+    host_triggers_tx: Sender<bool>,
 ) -> Result<(), String> {
     // Exit bump invalidates queued stale jobs IMMEDIATELY on disconnect,
     // not on the next `run()` — otherwise the reconnect backoff sleep
@@ -178,6 +185,18 @@ fn run(
     if ack.host_triggers {
         start_gui_event_forwarder(event_bus.clone(), writer_tx.clone(), forwarder_stop.clone());
     }
+
+    // Cut-over signal: send AFTER the forwarder subscribes so that
+    // events published in the window between forwarder-start and the
+    // GTK timer clearing the local engine are caught by the forwarder
+    // (and dispatched daemon-side). Sending before would let the timer
+    // clear local subscriptions while the forwarder is not yet
+    // subscribed — events in that gap would be lost by both engines.
+    // The drop guard symmetrically sends `false` on every `run()`
+    // exit, so a daemon crash mid-session restores local authority
+    // before the reconnect-backoff window opens.
+    let _ht_guard = HostTriggersGuard(host_triggers_tx.clone());
+    let _ = host_triggers_tx.send(ack.host_triggers);
 
     for line in reader.lines() {
         let line = line.map_err(|e| format!("read: {e}"))?;
@@ -249,6 +268,20 @@ struct ForwarderGuard(Arc<AtomicBool>);
 impl Drop for ForwarderGuard {
     fn drop(&mut self) {
         self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Drop-guard that signals the GTK timer to restore local trigger
+/// authority on `run()` exit. Without this, a daemon crash mid-session
+/// leaves the local engine empty (set by the prior `host_triggers=true`
+/// cut-over) for the entire reconnect-backoff window. The `send` is
+/// best-effort: if the receiver is gone (window already shut down),
+/// the error is benign.
+struct HostTriggersGuard(Sender<bool>);
+
+impl Drop for HostTriggersGuard {
+    fn drop(&mut self) {
+        let _ = self.0.send(false);
     }
 }
 

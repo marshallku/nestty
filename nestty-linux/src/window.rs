@@ -2,6 +2,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use gtk4::prelude::*;
@@ -189,6 +192,17 @@ impl NesttyWindow {
             pump_state.borrow().trigger_subs_len()
         );
 
+        // Cut-over state — daemon advertises via `gui.register` whether
+        // IT owns trigger dispatch. While the flag is `true`, this GUI's
+        // local engine is cleared and `watch_config` defers triggers to
+        // the daemon. The flag flips back to `false` whenever
+        // `gui_client::run` exits (disconnect / error), restoring local
+        // authority from the cached triggers — that's the
+        // disconnect-resilience contract for headless-daemon offline.
+        let host_triggers_active = Arc::new(AtomicBool::new(false));
+        let cached_triggers = Arc::new(Mutex::new(config.triggers.clone()));
+        let (ht_tx, ht_rx) = channel::<bool>();
+
         // Plugin discovery — sorted so plugin-by-name resolvers (panel
         // open, statusbar module timer) agree with the daemon's
         // `resolve_by_name` on duplicate manifest names.
@@ -217,7 +231,7 @@ impl NesttyWindow {
         // event_bus is passed so daemon-published events (chained
         // workflow completions, plugin events) bridge into the GUI bus
         // and feed the local TriggerEngine.
-        crate::gui_client::spawn(dispatch_tx.clone(), event_bus.clone());
+        crate::gui_client::spawn(dispatch_tx.clone(), event_bus.clone(), ht_tx);
 
         let tab_manager = TabManager::new(
             config,
@@ -275,6 +289,8 @@ impl NesttyWindow {
             &event_bus,
             &pump_state,
             &context,
+            &host_triggers_active,
+            &cached_triggers,
         );
 
         let mgr = tab_manager.clone();
@@ -285,7 +301,41 @@ impl NesttyWindow {
         let ctx_pump = context.clone();
         let trg_pump = triggers.clone();
         let pump_state_timer = pump_state.clone();
+        let bus_for_timer = event_bus.clone();
+        let ht_active = host_triggers_active.clone();
+        let cached_for_timer = cached_triggers.clone();
+        let last_applied_ht = Cell::new(false);
         glib::timeout_add_local(Duration::from_millis(50), move || {
+            // Cut-over consumer runs BEFORE pump_all: when the daemon's
+            // register ack lands with `host_triggers=true`, clear the
+            // local engine on the SAME tick so no events dispatch
+            // locally before the cut-over is applied.
+            //
+            // Edge-triggered: every `gui.register` ack sends a value
+            // (true OR false), and disconnect drop-guards always send
+            // `false`. Most are no-ops vs the current state — applying
+            // them anyway would clobber preflight/pending await state
+            // on every normal reconnect.
+            if let Some(value) = drain_to_latest(&ht_rx)
+                && value != last_applied_ht.get()
+            {
+                ht_active.store(value, Ordering::SeqCst);
+                last_applied_ht.set(value);
+                let cached = cached_for_timer.lock().unwrap().clone();
+                apply_host_triggers(
+                    value,
+                    &trg_pump,
+                    &mut pump_state_timer.borrow_mut(),
+                    &bus_for_timer,
+                    &cached,
+                );
+                log::info!(
+                    "host_triggers cut-over: active={value} | engine={} | bus pattern(s)={}",
+                    trg_pump.count(),
+                    pump_state_timer.borrow().trigger_subs_len()
+                );
+            }
+
             // `pump_all` drains context-driving events first, then trigger
             // events with per-event context snapshot. Single helper used by
             // both this timer and the hot-reload callback so semantics match.
@@ -443,6 +493,8 @@ fn watch_config(
     event_bus: &Arc<CoreEventBus>,
     pump_state: &Rc<RefCell<PumpState>>,
     context: &Arc<ContextService>,
+    host_triggers_active: &Arc<AtomicBool>,
+    cached_triggers: &Arc<Mutex<Vec<Trigger>>>,
 ) {
     let config_path = NesttyConfig::config_path();
     let file = gio::File::for_path(&config_path);
@@ -464,6 +516,8 @@ fn watch_config(
     let bus = event_bus.clone();
     let ps = pump_state.clone();
     let ctx = context.clone();
+    let ht_active = host_triggers_active.clone();
+    let cached = cached_triggers.clone();
     monitor.connect_changed(move |_, _, _, event| {
         if !matches!(
             event,
@@ -486,6 +540,17 @@ fn watch_config(
         mgr.update_config(&config);
         sb.reload(&config, &pl);
         bg.apply_config(&config);
+
+        // Always refresh the cache from disk — even when daemon is
+        // authoritative — so a later disconnect restores the freshest
+        // set, not the startup snapshot.
+        *cached.lock().unwrap() = config.triggers.clone();
+
+        if ht_active.load(Ordering::SeqCst) {
+            eprintln!("[nestty] triggers reload deferred to daemon (host_triggers_active)");
+            return;
+        }
+
         trg.set_triggers(config.triggers.clone());
         // Pump_all (context drain → trigger drain) on the OLD receiver set
         // before reconcile drops any: a pattern-narrowing reload (e.g.
@@ -503,6 +568,37 @@ fn watch_config(
     });
 
     std::mem::forget(monitor);
+}
+
+/// Consume every queued value on `rx` and return the most recent.
+/// Used by the 50ms cut-over consumer to collapse a fast flap
+/// (`true→false→true` within one tick) to the final state.
+pub fn drain_to_latest<T>(rx: &Receiver<T>) -> Option<T> {
+    let mut latest = None;
+    while let Ok(v) = rx.try_recv() {
+        latest = Some(v);
+    }
+    latest
+}
+
+/// Apply a host_triggers state change to the GUI's local
+/// TriggerEngine + PumpState. `true` clears the engine (daemon
+/// authoritative); `false` restores from the cached config triggers.
+/// Both branches reconcile pump subscriptions symmetrically.
+pub fn apply_host_triggers(
+    value: bool,
+    engine: &TriggerEngine,
+    pump_state: &mut PumpState,
+    bus: &Arc<CoreEventBus>,
+    cached: &[Trigger],
+) {
+    if value {
+        engine.set_triggers(Vec::new());
+        pump_state.reconcile_triggers(bus, &[]);
+    } else {
+        engine.set_triggers(cached.to_vec());
+        pump_state.reconcile_triggers(bus, cached);
+    }
 }
 
 /// Per-tick drain targets (context receivers + trigger subscriptions) so
@@ -628,5 +724,93 @@ impl TriggerSubscriptions {
 impl Default for TriggerSubscriptions {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nestty_core::action_registry::ActionRegistry;
+    use nestty_core::trigger::{TriggerEngine, TriggerSink, WhenSpec};
+    use serde_json::Value;
+    use std::sync::mpsc::channel;
+
+    fn mk_trigger(name: &str, kind: &str, action: &str) -> Trigger {
+        Trigger {
+            name: name.into(),
+            when: WhenSpec {
+                event_kind: kind.into(),
+                payload_match: serde_json::Map::new(),
+            },
+            action: action.into(),
+            params: Value::Null,
+            condition: None,
+            r#await: None,
+        }
+    }
+
+    fn mk_engine() -> (Arc<CoreEventBus>, Arc<TriggerEngine>) {
+        let bus = Arc::new(CoreEventBus::new());
+        let registry = Arc::new(ActionRegistry::new());
+        let sink: Arc<dyn TriggerSink> = registry as Arc<dyn TriggerSink>;
+        let engine = Arc::new(TriggerEngine::with_publish_bus(sink, bus.clone()));
+        (bus, engine)
+    }
+
+    #[test]
+    fn drain_to_latest_empty_returns_none() {
+        let (_tx, rx) = channel::<bool>();
+        assert!(drain_to_latest(&rx).is_none());
+    }
+
+    #[test]
+    fn drain_to_latest_returns_last_value() {
+        let (tx, rx) = channel::<bool>();
+        tx.send(true).unwrap();
+        tx.send(false).unwrap();
+        tx.send(true).unwrap();
+        assert_eq!(drain_to_latest(&rx), Some(true));
+        assert!(drain_to_latest(&rx).is_none());
+    }
+
+    #[test]
+    fn apply_host_triggers_true_clears_engine_and_subs() {
+        let (bus, engine) = mk_engine();
+        let cached = vec![mk_trigger("t1", "panel.focused", "system.log")];
+        engine.set_triggers(cached.clone());
+        let mut pump = PumpState {
+            ctx_focused: bus.subscribe("panel.focused"),
+            ctx_exited: bus.subscribe("panel.exited"),
+            ctx_cwd: bus.subscribe("terminal.cwd_changed"),
+            trigger_subs: TriggerSubscriptions::new(),
+        };
+        pump.reconcile_triggers(&bus, &cached);
+        assert!(pump.trigger_subs_len() > 0);
+
+        apply_host_triggers(true, &engine, &mut pump, &bus, &cached);
+        assert_eq!(engine.count(), 0);
+        assert_eq!(pump.trigger_subs_len(), 0);
+    }
+
+    #[test]
+    fn apply_host_triggers_false_restores_from_cache() {
+        let (bus, engine) = mk_engine();
+        let cached = vec![
+            mk_trigger("a", "panel.focused", "system.log"),
+            mk_trigger("b", "terminal.cwd_changed", "system.log"),
+        ];
+        let mut pump = PumpState {
+            ctx_focused: bus.subscribe("panel.focused"),
+            ctx_exited: bus.subscribe("panel.exited"),
+            ctx_cwd: bus.subscribe("terminal.cwd_changed"),
+            trigger_subs: TriggerSubscriptions::new(),
+        };
+        // Start in cut-over (daemon-authoritative) state.
+        apply_host_triggers(true, &engine, &mut pump, &bus, &cached);
+        assert_eq!(engine.count(), 0);
+
+        apply_host_triggers(false, &engine, &mut pump, &bus, &cached);
+        assert_eq!(engine.count(), 2);
+        assert_eq!(pump.trigger_subs_len(), 2);
     }
 }
