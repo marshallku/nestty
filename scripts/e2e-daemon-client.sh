@@ -21,6 +21,16 @@ NESTCTL="$REPO/target/debug/nestctl"
 [[ -x "$NESTCTL" ]] || { echo "build first: cargo build -p nestty-cli"; exit 2; }
 
 WORK="$(mktemp -d -t nestty-e2e.XXXXXX)"
+# Step 12's marker path is interpolated into both a TOML string and
+# a `/bin/sh -c` command. Use a STRICT allowlist (alphanumerics +
+# `._/-`) so no shell metacharacter (`;`, `&`, backtick, `>`, `|`,
+# newline, quote, dollar, etc.) and no TOML-corrupting char (`"`,
+# `\`) can sneak in via a maliciously-set TMPDIR. Default /tmp is
+# always safe.
+if ! printf '%s' "$WORK" | LC_ALL=C grep -Eq '^[A-Za-z0-9._/-]+$'; then
+    echo "Refusing to run: WORK path '$WORK' contains characters outside [A-Za-z0-9._/-]. Set TMPDIR to a plain ASCII path." >&2
+    exit 2
+fi
 DAEMON_LOG="$WORK/daemon.log"
 GUI_LOG="$WORK/gui.log"
 SOCKET="$WORK/nesttyd.sock"
@@ -666,6 +676,96 @@ while (( SECONDS < fire_deadline )); do
 done
 (( fired == 1 )) || fail "daemon did not dispatch the nestctl-published trigger (system.log line absent)"
 pass "daemon dispatched nestctl-published e2e.publish → system.log fired"
+
+step 12 "system.spawn inherits primary GUI's curated env"
+# Register a mock GUI with custom HYPRLAND_INSTANCE_SIGNATURE, fire
+# a system.spawn trigger that writes the env var to a marker file,
+# verify the child saw the GUI's value (not the daemon's empty/absent
+# value). Proves the Stage E env merge end-to-end:
+# GUI capture → daemon whitelist → primary_gui_env → Command::envs.
+ENV_MARKER="$WORK/spawn-env-marker"
+ENV_RELOAD_COUNT_BEFORE=$(grep -cE 'trigger config reloaded' "$DAEMON_LOG" 2>/dev/null) || ENV_RELOAD_COUNT_BEFORE=0
+cat > "$XDG_CONFIG_HOME/nestty/config.toml" <<TOML
+[[triggers]]
+name = "e2e-envspawn"
+action = "system.spawn"
+params = { argv = ["/bin/sh", "-c", "echo \"\$HYPRLAND_INSTANCE_SIGNATURE\" > $ENV_MARKER"] }
+[triggers.when]
+event_kind = "e2e.envspawn"
+TOML
+wait_for_count 'trigger config reloaded' "$DAEMON_LOG" "$(( ENV_RELOAD_COUNT_BEFORE + 1 ))" 8 \
+    || fail "daemon's config watcher did not pick up the env-spawn trigger"
+
+ENV_LOG="$WORK/envspawn.log"
+python3 - "$SOCKET" >"$ENV_LOG" 2>&1 <<'PY'
+import json, socket, sys, threading, time, uuid
+
+sock_path = sys.argv[1]
+
+def read_response(f, target_id, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        line = f.readline()
+        if not line:
+            return None
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if msg.get("id") == target_id and "ok" in msg:
+            return msg
+    return None
+
+gui = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+gui.connect(sock_path)
+gui.settimeout(2.0)
+f = gui.makefile("rwb", buffering=0)
+reg_id = str(uuid.uuid4())
+reg = {"id": reg_id, "method": "gui.register",
+       "params": {"window_id": str(uuid.uuid4()),
+                  "capabilities": ["tab"],
+                  "want_primary": True, "protocol_version": 1,
+                  "gui_env": {
+                      "HYPRLAND_INSTANCE_SIGNATURE": "e2e-fake-hypr-sig",
+                  }}}
+f.write((json.dumps(reg) + "\n").encode())
+reg_resp = read_response(f, reg_id)
+pub_id = str(uuid.uuid4())
+pub = {"id": pub_id, "method": "_bus.publish",
+       "params": {"kind": "e2e.envspawn", "source": "e2e-mock",
+                  "timestamp_ms": 1, "payload": {}}}
+f.write((json.dumps(pub) + "\n").encode())
+pub_resp = read_response(f, pub_id)
+# Keep the connection alive briefly — primary_gui_env is keyed off
+# the active registration. Unregistering immediately could race the
+# spawn worker depending on scheduling.
+time.sleep(1.5)
+gui.close()
+print(json.dumps({
+    "register_ok": (reg_resp or {}).get("ok"),
+    "publish_ok": (pub_resp or {}).get("ok"),
+}))
+PY
+E_SUMMARY=$(tail -n1 "$ENV_LOG")
+reg_ok=$(python3 -c "import sys,json; print(json.loads(sys.argv[1])['register_ok'])" "$E_SUMMARY")
+[[ "$reg_ok" == "True" ]] || fail "GUI register with gui_env failed: $E_SUMMARY"
+pub_ok=$(python3 -c "import sys,json; print(json.loads(sys.argv[1])['publish_ok'])" "$E_SUMMARY")
+[[ "$pub_ok" == "True" ]] || fail "_bus.publish failed: $E_SUMMARY"
+
+# Marker file should now contain the GUI-supplied signature. system.spawn
+# is fire-and-forget so poll briefly for the file.
+marker_deadline=$(( SECONDS + 5 ))
+captured=""
+while (( SECONDS < marker_deadline )); do
+    if [[ -s "$ENV_MARKER" ]]; then
+        captured=$(cat "$ENV_MARKER")
+        break
+    fi
+    sleep 0.2
+done
+[[ "$captured" == "e2e-fake-hypr-sig" ]] \
+    || fail "system.spawn child did not see GUI env (expected 'e2e-fake-hypr-sig', got '$captured')"
+pass "system.spawn child inherited HYPRLAND_INSTANCE_SIGNATURE from primary GUI's gui_env"
 
 echo
 echo "=== AUTO E2E COMPLETE ==="

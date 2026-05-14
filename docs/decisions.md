@@ -267,3 +267,21 @@ The public surface accepts `{ kind: String, payload?: Value }` and **daemon-cont
 The decision to leave trigger condition / interpolation reading payload-source first (an existing pre-Stage-D semantic, preserved) is a user-config concern: if a trigger author writes `condition = "event.source == 'foo'"`, they're reading payload, not provenance. The daemon's trust gates (`try_promote_or_drop_preflight`) operate on top-level fields, which the daemon controls; user-defined conditions on `event.source` would need to verify payload absence to gate on daemon-controlled provenance. Documented in the user-facing trigger config docs (forthcoming).
 
 **See:** `nestty-daemon/src/socket.rs` (`peer_pid`, `handle_events_publish`), `nestty-cli/src/commands.rs` + `nestty-cli/src/main.rs` (`EventCommand::Publish`, `dispatch_publish`), and e2e step 11 in `scripts/e2e-daemon-client.sh`.
+
+## 24. Curated GUI Env Whitelist for `system.spawn` (Step 5b.2 Stage E)
+
+**Problem:** Stage A relocated `system.spawn` from the GUI's `LiveTriggerSink` to the daemon's `DaemonTriggerSink`, but the child process now inherits the daemon's process env, not the GUI's. Hyprland trigger configs (the user's primary `system.spawn` use case — `hyprctl dispatch` calls) depend on `HYPRLAND_INSTANCE_SIGNATURE`, which the daemon doesn't have because `nesttyd` was started by `systemd --user` or the login shell before the compositor ran. Wayland/X11 tooling (`notify-send`, `pactl`) needs `DISPLAY` / `WAYLAND_DISPLAY` / `DBUS_SESSION_BUS_ADDRESS` for the same reason.
+
+**Decision:** A curated whitelist of session env keys flows from the GUI to the daemon at `gui.register` time. The daemon-side filter is the trust boundary; the GUI-side curation is UX-only.
+
+The 7-key whitelist (`HYPRLAND_INSTANCE_SIGNATURE`, `DISPLAY`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, `XDG_SESSION_TYPE`, `XDG_CURRENT_DESKTOP`, `DBUS_SESSION_BUS_ADDRESS`) covers Hyprland + standard Wayland/X11 + session-bus tooling. Anything outside the list — `PATH`, `LD_PRELOAD`, `OPENAI_API_KEY`, terminal aliases — is dropped at `filter_gui_env` BEFORE the env reaches `GuiClient.gui_env`. Codex round-1 C1 surfaced the subtle but important point: GUI-side filtering alone is not load-bearing because any registered client could be a mock (e.g., the e2e test infra itself), and the daemon cannot distinguish a legitimate `nestty-linux` from a malicious script.
+
+`DaemonTriggerSink::handle_system_spawn` merges primary's env via `Command::envs(gui_env)`. Rust's `Command::new` inherits the parent's env by default; `envs` OVERRIDES matching keys without clearing unlisted ones. So `PATH`, `HOME`, `USER` from the daemon persist while `DISPLAY` etc. are pulled from the GUI's filtered map. Critically, `env_clear` is NOT called — that would strip `PATH` and break `/usr/bin/env`-style triggers.
+
+`GuiRegistry::primary_gui_env()` returns `Option<HashMap<String, String>>`. Lock order `clients → primary` mirrors `route()`'s order to avoid an AB-BA deadlock against any caller that already holds `clients` (codex round-1 C2). When no GUI is registered (pure headless mode), the accessor returns `None` and the sink falls back to pure daemon env — the pre-Stage-E behavior, preserved.
+
+**Tradeoff:** Capturing env once at register time, not at spawn time. If the user restarts their Hyprland session while `nesttyd` stays running (rare), the cached signature is stale until reconnect. Refresh-on-register is the simplest path and matches user expectation (session vars are write-once). Pid-reuse semantics on `peer_pid` (Stage D) have the same property: connect-time snapshot wins. macOS daemon stub returns empty `gui_env` map; when the macOS shell eventually ships, it'll need its own env-capture wire.
+
+Curated whitelist drift is the maintenance hazard. New keys added to the list need an audit: each one is a vector if someone misconfigures a trigger to spawn shell-quoted user input that interpolates an env var.
+
+**See:** `nestty-daemon/src/gui_registry.rs` (`GUI_ENV_ALLOWED_KEYS`, `filter_gui_env`, `GuiClient.gui_env`, `primary_gui_env`), `nestty-linux/src/gui_client.rs` (`GUI_ENV_CURATED_KEYS`, `capture_gui_env`), `nestty-daemon/src/daemon_trigger_sink.rs` (`handle_system_spawn` env merge), and e2e step 12 in `scripts/e2e-daemon-client.sh`.
