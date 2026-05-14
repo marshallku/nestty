@@ -32,27 +32,36 @@ const FALLTHROUGH_QUEUE: usize = 256;
 
 pub struct DaemonTriggerSink {
     registry: Arc<ActionRegistry>,
+    /// Held so `system.spawn` can merge the registered GUI's curated
+    /// env (`HYPRLAND_INSTANCE_SIGNATURE`, `DISPLAY`, etc.) into the
+    /// child's environment. The fallthrough worker also reaches the
+    /// registry, but it holds its own clone via the worker's move
+    /// closure.
+    gui: Arc<GuiRegistry>,
     fallthrough_tx: mpsc::SyncSender<(String, Value)>,
 }
 
 impl DaemonTriggerSink {
     pub fn new(registry: Arc<ActionRegistry>, gui: Arc<GuiRegistry>) -> Self {
         let (tx, rx) = mpsc::sync_channel::<(String, Value)>(FALLTHROUGH_QUEUE);
+        let gui_for_worker = gui.clone();
         thread::Builder::new()
             .name("nestty-trigger-fallthrough".into())
-            .spawn(move || fallthrough_worker(rx, gui))
+            .spawn(move || fallthrough_worker(rx, gui_for_worker))
             .expect("spawn trigger fallthrough worker");
         Self {
             registry,
+            gui,
             fallthrough_tx: tx,
         }
     }
 
-    /// Mirrors [`crate::trigger_sink::LiveTriggerSink::handle_system_spawn`].
-    /// The GUI env merge (Hyprland/Wayland) will be added in Stage C; for
-    /// Stage A the child inherits daemon env only, which preserves the
-    /// pre-relocation behavior for daemon-launched triggers.
-    fn handle_system_spawn(params: Value) -> ActionResult {
+    /// Spawn child for trigger-fired `system.spawn`. Merges the
+    /// registered primary GUI's curated env (Stage E) on top of the
+    /// daemon's inherited env, so triggers running under a graphical
+    /// session see `HYPRLAND_INSTANCE_SIGNATURE` etc. With no
+    /// registered GUI (headless), the child inherits daemon env only.
+    fn handle_system_spawn(&self, params: Value) -> ActionResult {
         let argv = params
             .get("argv")
             .and_then(|v| v.as_array())
@@ -74,14 +83,19 @@ impl DaemonTriggerSink {
             ));
         }
         let program = argv_strs[0].clone();
-        let mut child = std::process::Command::new(&program)
-            .args(&argv_strs[1..])
+        let mut cmd = std::process::Command::new(&program);
+        cmd.args(&argv_strs[1..])
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| {
-                internal_error(format!("system.spawn: failed to exec {program:?}: {e}"))
-            })?;
+            .stdout(std::process::Stdio::null());
+        // Merge primary GUI's daemon-filtered env on top of inherited
+        // daemon env. `Command::envs` OVERRIDES matching keys without
+        // clearing unrelated ones (PATH etc. from the daemon stay).
+        if let Some(gui_env) = self.gui.primary_gui_env() {
+            cmd.envs(gui_env);
+        }
+        let mut child = cmd.spawn().map_err(|e| {
+            internal_error(format!("system.spawn: failed to exec {program:?}: {e}"))
+        })?;
         let pid = child.id();
         log::info!("trigger system.spawn pid={pid} argv={argv_strs:?}");
         let argv_log = argv_strs;
@@ -99,7 +113,7 @@ impl DaemonTriggerSink {
 impl TriggerSink for DaemonTriggerSink {
     fn dispatch_action(&self, action: &str, params: Value) -> ActionResult {
         if action == "system.spawn" {
-            return Self::handle_system_spawn(params);
+            return self.handle_system_spawn(params);
         }
         if self.registry.has(action) {
             if self.registry.is_blocking(action) {
