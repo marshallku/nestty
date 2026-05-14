@@ -276,6 +276,41 @@ pub fn run_accept_loop(listener: UnixListener, state: Arc<DaemonState>) {
     }
 }
 
+/// Extract the peer process's pid from a Unix socket via
+/// `SO_PEERCRED`. Used by `events.publish` to stamp the event's
+/// `source = "client.<pid>"` so trigger configs can correlate
+/// publishes to their originating script. Linux-only; non-Linux
+/// builds return `None` and the handler falls back to
+/// `client.unknown`.
+#[cfg(target_os = "linux")]
+fn peer_pid(stream: &UnixStream) -> Option<u32> {
+    use std::mem::MaybeUninit;
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let mut cred: MaybeUninit<libc::ucred> = MaybeUninit::uninit();
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            cred.as_mut_ptr() as *mut _,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    Some(unsafe { cred.assume_init() }.pid as u32)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peer_pid(_stream: &UnixStream) -> Option<u32> {
+    // Other platforms use `LOCAL_PEERCRED` / `getpeereid` — out of
+    // scope for v1; callers fall back to `client.unknown`.
+    None
+}
+
 fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) {
     let write_stream = match stream.try_clone() {
         Ok(s) => s,
@@ -284,6 +319,7 @@ fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) {
             return;
         }
     };
+    let peer = peer_pid(&stream);
     // Third fd handed to GuiClient so unregister (heartbeat or other)
     // can shutdown(Both) from outside this reader thread.
     let shutdown_stream = stream.try_clone().ok();
@@ -356,6 +392,15 @@ fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) {
                     // GUI event). Auth: registered-GUI convention under
                     // the 0600 socket trust model.
                     let resp = handle_bus_publish(&req, &state, registered_client_id.as_deref());
+                    send_line(&writer_tx, &resp);
+                    continue;
+                }
+                if req.method == "events.publish" {
+                    // Public external surface — no registered-GUI gate.
+                    // 0600 socket reachability IS the auth. `source` and
+                    // `timestamp_ms` are daemon-controlled to prevent
+                    // spoofing of action-registry completion events.
+                    let resp = handle_events_publish(&req, &state, peer);
                     send_line(&writer_tx, &resp);
                     continue;
                 }
@@ -492,6 +537,42 @@ fn handle_bus_publish(
     let mut event = BusEvent::new(kind, source, payload);
     event.timestamp_ms = timestamp_ms;
     state.event_bus.publish_bridged(event, bridge_id);
+    Response::success(req.id.clone(), serde_json::json!({ "queued": true }))
+}
+
+/// `events.publish` public socket method. Anyone reaching the
+/// 0600 socket can call it (same trust band as `nestctl call`).
+/// Daemon-controls `source` (peer-pid stamped) and `timestamp_ms`
+/// (via `BusEvent::new`) so the caller cannot spoof an
+/// action-registry completion event — the trigger engine's
+/// preflight-promotion gate reads top-level `source` and trusts
+/// only `nestty.action`.
+fn handle_events_publish(req: &Request, state: &Arc<DaemonState>, peer: Option<u32>) -> Response {
+    let kind = match req.params.get("kind").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return Response::error(
+                req.id.clone(),
+                "invalid_params",
+                "events.publish requires non-empty `kind` string",
+            );
+        }
+    };
+    if kind.ends_with(".completed") || kind.ends_with(".failed") {
+        return Response::error(
+            req.id.clone(),
+            "invalid_params",
+            "events.publish refuses reserved `.completed`/`.failed` kinds",
+        );
+    }
+    let payload = req.params.get("payload").cloned().unwrap_or(Value::Null);
+    let source = match peer {
+        Some(pid) => format!("client.{pid}"),
+        None => "client.unknown".into(),
+    };
+    state
+        .event_bus
+        .publish(nestty_core::event_bus::Event::new(kind, source, payload));
     Response::success(req.id.clone(), serde_json::json!({ "queued": true }))
 }
 
@@ -1009,6 +1090,139 @@ mod tests {
         assert_eq!(ev.source, "mock");
         assert_eq!(ev.timestamp_ms, 42);
         assert!(ev.bridge_id.is_some());
+        let _ = std::fs::remove_file(&path_clone);
+    }
+
+    #[test]
+    fn events_publish_works_without_register_and_assigns_source() {
+        let path = tmp_socket();
+        let _ = std::fs::remove_file(&path);
+        let listener = bind_listener(&path).expect("bind");
+        let state = mk_state_with_ping();
+        let rx = state.event_bus.subscribe_unbounded("e2e.public");
+        let path_clone = path.clone();
+        let _server = thread::spawn(move || run_accept_loop(listener, state));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let stream = UnixStream::connect(&path_clone).expect("connect");
+        let mut writer = stream.try_clone().expect("clone");
+        let mut reader = BufReader::new(stream);
+        let req = Request::new(
+            "ep-1",
+            "events.publish",
+            json!({"kind": "e2e.public", "payload": {"hi": true}}),
+        );
+        writer
+            .write_all((serde_json::to_string(&req).unwrap() + "\n").as_bytes())
+            .expect("write");
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read");
+        let resp: Response = serde_json::from_str(line.trim()).expect("parse");
+        assert!(
+            resp.ok,
+            "events.publish should succeed without register: {resp:?}"
+        );
+        // Event landed on the bus with daemon-assigned source.
+        let ev = match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+            nestty_core::event_bus::RecvOutcome::Event(e) => e,
+            other => panic!("expected event, got {other:?}"),
+        };
+        assert_eq!(ev.kind, "e2e.public");
+        assert!(
+            ev.source.starts_with("client."),
+            "source should be daemon-assigned client.<pid>, got {}",
+            ev.source
+        );
+        assert_eq!(ev.payload, json!({"hi": true}));
+        assert!(ev.timestamp_ms > 0, "daemon-assigned timestamp present");
+        let _ = std::fs::remove_file(&path_clone);
+    }
+
+    #[test]
+    fn events_publish_rejects_empty_kind() {
+        let path = tmp_socket();
+        let _ = std::fs::remove_file(&path);
+        let listener = bind_listener(&path).expect("bind");
+        let state = mk_state_with_ping();
+        let path_clone = path.clone();
+        let _server = thread::spawn(move || run_accept_loop(listener, state));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let stream = UnixStream::connect(&path_clone).expect("connect");
+        let mut writer = stream.try_clone().expect("clone");
+        let mut reader = BufReader::new(stream);
+        let req = Request::new(
+            "ep-empty",
+            "events.publish",
+            json!({"kind": "", "payload": {}}),
+        );
+        writer
+            .write_all((serde_json::to_string(&req).unwrap() + "\n").as_bytes())
+            .expect("write");
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read");
+        let resp: Response = serde_json::from_str(line.trim()).expect("parse");
+        assert!(!resp.ok);
+        assert_eq!(resp.error.expect("err").code, "invalid_params");
+        let _ = std::fs::remove_file(&path_clone);
+    }
+
+    #[test]
+    fn events_publish_rejects_reserved_kind_suffix() {
+        let path = tmp_socket();
+        let _ = std::fs::remove_file(&path);
+        let listener = bind_listener(&path).expect("bind");
+        let state = mk_state_with_ping();
+        let path_clone = path.clone();
+        let _server = thread::spawn(move || run_accept_loop(listener, state));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let stream = UnixStream::connect(&path_clone).expect("connect");
+        let mut writer = stream.try_clone().expect("clone");
+        let mut reader = BufReader::new(stream);
+        let req = Request::new(
+            "ep-suffix",
+            "events.publish",
+            json!({"kind": "foo.completed", "payload": {}}),
+        );
+        writer
+            .write_all((serde_json::to_string(&req).unwrap() + "\n").as_bytes())
+            .expect("write");
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read");
+        let resp: Response = serde_json::from_str(line.trim()).expect("parse");
+        assert!(!resp.ok);
+        assert_eq!(resp.error.expect("err").code, "invalid_params");
+        let _ = std::fs::remove_file(&path_clone);
+    }
+
+    #[test]
+    fn events_publish_omits_payload_defaults_to_null() {
+        let path = tmp_socket();
+        let _ = std::fs::remove_file(&path);
+        let listener = bind_listener(&path).expect("bind");
+        let state = mk_state_with_ping();
+        let rx = state.event_bus.subscribe_unbounded("e2e.npayload");
+        let path_clone = path.clone();
+        let _server = thread::spawn(move || run_accept_loop(listener, state));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let stream = UnixStream::connect(&path_clone).expect("connect");
+        let mut writer = stream.try_clone().expect("clone");
+        let mut reader = BufReader::new(stream);
+        let req = Request::new("ep-np", "events.publish", json!({"kind": "e2e.npayload"}));
+        writer
+            .write_all((serde_json::to_string(&req).unwrap() + "\n").as_bytes())
+            .expect("write");
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read");
+        let resp: Response = serde_json::from_str(line.trim()).expect("parse");
+        assert!(resp.ok);
+        let ev = match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+            nestty_core::event_bus::RecvOutcome::Event(e) => e,
+            other => panic!("expected event, got {other:?}"),
+        };
+        assert_eq!(ev.payload, Value::Null);
         let _ = std::fs::remove_file(&path_clone);
     }
 
