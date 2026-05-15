@@ -105,8 +105,12 @@ DAEMON_SOCK="$HOME/Library/Caches/nestty/socket"
 target/release/nestctl --socket "$DAEMON_SOCK" call system.ping
 # {"status": "ok"}
 
-target/release/nestctl --socket "$DAEMON_SOCK" call system.list_actions
-# {"count": 44, "names": [...]}  ← 9개 first-party plugin이 daemon-side에서 spawn됨
+# `system.list_actions`는 macOS GUI의 in-process registry 전용 — daemon은
+# 이 메서드를 register하지 않으므로 daemon socket으로 호출하면 unknown_method.
+# Daemon-side plugin이 정상 spawn됐는지는 plugin 자체의 health-check action
+# 으로 확인. 예: echo plugin은 ping을 노출.
+target/release/nestctl --socket "$DAEMON_SOCK" call echo.ping --params '{"hi":"there"}'
+# {"echoed": {"hi": "there"}, "from": "nestty-plugin-echo"}  ← daemon-side echo plugin 정상
 
 # 4. 종료
 pkill -x nesttyd
