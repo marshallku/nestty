@@ -395,3 +395,33 @@ Under the final design, the SERVICE sees each invoke exactly once across the ful
 **Tradeoff:** No param prompt in v1. Adding a form builder for actions that need params would double the diff and pull in an opinion about the form-rendering layer. v2 can wire a second-stage form (or just let the user `nestctl call <method> --params '{...}'` for parametric actions).
 
 **See:** `nestty-linux/src/command_palette.rs` (full implementation + 5 unit tests on `filter_actions`), `nestty-linux/src/tabs.rs` (Ctrl+Shift+P key arm + Ctrl+Shift+Left for prev-pane), `nestty-linux/src/window.rs` (TabManager::new wired with actions registry).
+
+
+## 30. URL click-to-open (Phase 7 closing)
+
+**Problem:** Plain-text URLs in terminal output were not clickable. The roadmap-declared affordance was Ctrl+Click on a URL to open it in the default browser, plus support for OSC 8 hyperlinks (where visible text can differ from the target URL).
+
+**Decision:** Implement in a dedicated `nestty-linux/src/url_click.rs` module installed once per `TerminalPanel` from `tabs.rs::create_panel`. Two match paths feed the same launch handler:
+
+1. **Regex URL detection** via VTE's `match_add_regex` + `check_match_at`. Pattern: `(?i:https?://[^\s<>'"]+)` with `PCRE2_MULTILINE` only. Trailing punctuation (`.,;:!?)]}>`) is stripped post-match by `normalize_url` rather than excluded from the regex — keeps the pattern simple and the trim rule auditable.
+
+2. **OSC 8 hyperlinks** via `set_allow_hyperlink(true)` + `check_hyperlink_at(x, y)`. Wins over the regex tag because OSC 8 emitters set the visible label independently of the URL target (`]8;;https://x\click here]8;;\` — the regex would only see "click here").
+
+**Critical implementation detail — flags + jit:** Initial implementation used `PCRE2_MULTILINE | PCRE2_CASELESS` plus `regex.jit(PCRE2_JIT_COMPLETE)`. `check_match_at` returned `(None, -1)` for every coordinate, even with a trivial pattern like `[a-z]+` — `cargo test` passed, but the live API silently returned no matches. After tracing gnome-console's C source for reference, the working setup is:
+
+- compile flags = `PCRE2_MULTILINE` only (no `PCRE2_CASELESS`)
+- inline `(?i:...)` group for case-insensitive matching
+- no JIT call
+
+The exact failure mode is undiagnosed (vte4 0.8.0 + VTE 0.84 ABI quirk vs. silent PCRE2 flag rejection vs. JIT interaction). Anchoring to gnome-console's flag set is the safest path until a public reproducer exists.
+
+**Scheme allow-list (Ctrl+click).** `normalize_url` rejects anything other than `http://` and `https://`. The check applies uniformly to OSC 8 hyperlink targets AND regex hits — an OSC 8 emitter could otherwise inject `javascript:` or `file://` payloads through arbitrary terminal output.
+
+**Ctrl+Click gate.** Plain click on a URL would steal text selection — gnome-terminal/foot/kitty all gate on Ctrl. The `GestureClick` is registered with `PropagationPhase::Capture` and `connect_pressed` so VTE's selection gesture doesn't claim the sequence first; on a successful URL launch the gesture state is set to `Claimed` so VTE doesn't see the click.
+
+**`gtk4::UriLauncher` over `xdg-open`.** GIO MIME default-handler resolution, no subprocess `Child` to leak, parent-window hint for any error dialogs.
+
+**OSC 52 status (roadmap Phase 7 item 125):** already closed elsewhere. macOS Tier 0.3 gates `clipboardCopy` via `[security] osc52`; Linux VTE 0.84 is deny-by-default and exposes no toggle property in vte4 0.8.0. No Linux code change needed — roadmap entry updated to back-link to Tier 0.3.
+
+**See:** `nestty-linux/src/url_click.rs` (full implementation + 6 unit tests on `normalize_url`), `nestty-linux/src/tabs.rs::create_panel` (install site), `nestty-linux/src/main.rs` (`mod url_click;`).
+

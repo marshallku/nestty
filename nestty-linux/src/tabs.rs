@@ -782,6 +782,10 @@ impl TabManager {
 
         *widget_holder.borrow_mut() = Some(panel.widget().clone());
 
+        if let Some(term) = panel.as_terminal() {
+            crate::url_click::install(&term.terminal, window);
+        }
+
         // Hook terminal output events
         if let Some(term) = panel.as_terminal() {
             let bus = self.event_bus.clone();

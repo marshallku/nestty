@@ -11,6 +11,7 @@ mod split;
 mod statusbar;
 mod tabs;
 mod terminal;
+mod url_click;
 mod webview;
 mod window;
 

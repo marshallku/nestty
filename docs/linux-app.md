@@ -116,6 +116,7 @@ All built-in shortcuts use `Ctrl+Shift` — Ctrl-only keys pass through to termi
 | `Ctrl+Shift+P`                      | Command palette (filter-and-dispatch any registered action) |
 | `Ctrl+Shift+Tab`                    | Next tab                            |
 | `Ctrl+Shift+1-9`                    | Switch to tab N                     |
+| `Ctrl+Click` (on URL)               | Open URL in default browser (OSC 8 hyperlinks + http(s) regex) |
 
 ### Custom Keybindings
 
