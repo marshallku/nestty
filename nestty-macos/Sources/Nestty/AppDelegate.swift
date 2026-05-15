@@ -31,6 +31,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Bridges Cmd/Option + Backspace/Delete to readline control bytes — see
     /// `installEditKeyMonitor()` for why this can't be done inside SwiftTerm.
     private var editKeyMonitor: Any?
+    /// PR 2 (daemon-first migration). Nullable because construction happens
+    /// inside `applicationDidFinishLaunching` after the runtime dir + paths
+    /// are known. Background reconnect loop owned by the client itself.
+    private var daemonClient: DaemonClient?
 
     func applicationDidFinishLaunching(_: Notification) {
         // PR 1 (Tier 2.1) FFI smoke test. Proves the Rust staticlib linked
@@ -55,13 +59,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // will register additional actions through this same path.
         registerBuiltinActions()
 
-        // PR 3 (Tier 3) plugin supervisor — discover ~/Library/Application Support/nestty/plugins/
-        // (and ~/.config/nestty/plugins/ for dotfile-sharing users), spawn services
-        // with onStartup activation, run init handshake, register provides[]
-        // actions with the registry. Must run BEFORE startSocketServer so any
-        // nestctl call that lands while the socket comes up sees the registered
-        // plugin actions.
-        pluginSupervisor.discoverAndStart()
+        // PR 2 (daemon-first migration) — Nestty.app becomes a daemon client.
+        // Plugin host moves to `nesttyd`; the in-process `PluginSupervisor`
+        // class survives this PR for rollback safety (deleted in PR 5) but
+        // its `discoverAndStart()` is no longer invoked.
+        //
+        // ActionRegistry's fallback handler forwards anything not registered
+        // locally to the daemon when connected. When the daemon is down,
+        // forwards return `daemon_unavailable` per the user-decided narrower
+        // fallback contract — local engine still fires GUI-only triggers
+        // (tab/split/terminal/background/...) but plugin/registry actions
+        // require daemon.
+        daemonClient = DaemonClient(
+            socket: NesttyPaths.daemonSocket(),
+            capabilities: ["tab", "split", "webview", "background", "statusbar", "terminal", "agent.ui", "plugin.open", "search", "session"],
+        )
+        actionRegistry.setFallbackHandler { [weak self] method, params, completion in
+            guard let client = self?.daemonClient else {
+                completion(RPCError(code: "daemon_unavailable", message: "DaemonClient not initialized"))
+                return
+            }
+            if !client.isConnected {
+                completion(RPCError(code: "daemon_unavailable", message: "daemon not connected (forward of \(method))"))
+                return
+            }
+            // Silent — daemon-side ActionRegistry already publishes the
+            // `<method>.completed`/`.failed` event; PR4b will bridge them
+            // back. Re-publishing here would double-fire.
+            client.forward(method: method, params: params, completion: completion)
+        }
+        daemonClient?.start()
 
         let config = NesttyConfig.load()
         let theme = NesttyTheme.byName(config.themeName) ?? .catppuccinMocha
@@ -1057,7 +1084,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             completion(["plugins": plugins])
 
         default:
-            completion(nil)
+            // PR 2: legacy switch missed → ActionRegistry fallback handler
+            // forwards to daemon (or returns daemon_unavailable / unknown_method).
+            // Codex round 3 C1 explicitly requires this ordering: registry →
+            // legacy switch → fallback. GUI-owned methods that fall here would
+            // bounce to daemon and back via Invoke (PR3 not yet); DaemonClient's
+            // `isGuiOwned` guard catches them and returns unknown_method fast.
+            actionRegistry.tryDispatchOrFallback(method, params: params, completion: completion)
         }
     }
 

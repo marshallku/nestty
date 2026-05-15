@@ -303,15 +303,13 @@ final class NesttyEngine: @unchecked Sendable {
                 FileHandle.standardError.write(Data("[nestty-engine] action callback fired but no ActionRegistry attached: \(actionName)\n".utf8))
                 return
             }
-            let dispatched = registry.tryDispatch(actionName, params: params) { _ in
-                // Fire-and-forget — discard the action's own completion result.
-                // Triggers don't currently consume completion data on macOS;
-                // when await semantics land we'll plumb this back into the
-                // Rust engine via a separate FFI call.
-            }
-            if !dispatched {
-                FileHandle.standardError.write(Data("[nestty-engine] trigger fired \(actionName) but no handler registered (registry has: \(registry.names()))\n".utf8))
-            }
+            // PR2: tryDispatchOrFallback so trigger-fired actions that point
+            // at daemon-owned plugins (kb.search, slack.message, etc.) get
+            // forwarded automatically. Fire-and-forget completion still
+            // discards results — when await semantics land we'll plumb
+            // success/error back into the Rust engine via a separate FFI
+            // call.
+            registry.tryDispatchOrFallback(actionName, params: params) { _ in }
         }
     }
 }

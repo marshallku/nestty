@@ -163,17 +163,16 @@ enum Keybindings {
             guard pair.count == 2 else { continue }
             params[String(pair[0])] = String(pair[1])
         }
-        let dispatched = registry.tryDispatch(method, params: params) { result in
-            // Fire-and-forget. Surface errors in stderr so a misconfigured
-            // binding gets debugged easily.
+        // PR2: route through tryDispatchOrFallback so daemon-owned actions
+        // forwarded automatically (registered locally first, fallback to
+        // daemon if not). Unknown method now surfaces as `unknown_method`
+        // RPCError from the fallback rather than the old "not registered"
+        // log line.
+        registry.tryDispatchOrFallback(method, params: params) { result in
             if let err = result as? RPCError {
                 let msg = "[nestty] keybinding action \(method) failed: \(err.code) — \(err.message)\n"
                 FileHandle.standardError.write(Data(msg.utf8))
             }
-        }
-        if !dispatched {
-            let msg = "[nestty] keybinding action \(method) not registered\n"
-            FileHandle.standardError.write(Data(msg.utf8))
         }
     }
 }

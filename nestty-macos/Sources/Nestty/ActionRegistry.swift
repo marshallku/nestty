@@ -157,6 +157,42 @@ final class ActionRegistry {
         return true
     }
 
+    /// Try `tryDispatch`; if it misses, route through the optional fallback
+    /// handler (set by `setFallbackHandler`). When neither matches, complete
+    /// with `RPCError(unknown_method, ...)` so callers don't have to write
+    /// the same fall-through ladder. Used by `Keybindings`, `PluginPanel`,
+    /// and the FFI trigger callback — all paths that aren't `SocketServer`
+    /// (which keeps its legacy switch + fallback ordering for back-compat).
+    ///
+    /// PR2: fallback handler is wired in `AppDelegate` to forward to
+    /// daemon when `DaemonClient.isConnected` is true, else returns
+    /// `daemon_unavailable`. Daemon-forward path is **silent** (does not
+    /// trigger `<method>.completed` fan-out) because daemon-side
+    /// `ActionRegistry` already publishes that event and bridging it back
+    /// (PR4b) would double-fire.
+    func tryDispatchOrFallback(
+        _ method: String,
+        params: [String: Any],
+        completion: @escaping (Any?) -> Void,
+    ) {
+        if tryDispatch(method, params: params, completion: completion) { return }
+        if let fallback = fallbackHandler {
+            fallback(method, params, completion)
+        } else {
+            completion(RPCError(code: "unknown_method", message: "no handler for \(method)"))
+        }
+    }
+
+    /// Install the catch-all forward handler. Called once during app
+    /// startup after `DaemonClient` is constructed. Replacing on a later
+    /// call overwrites — there's only one fallback path on macOS today.
+    func setFallbackHandler(_ handler: @escaping FallbackHandler) {
+        fallbackHandler = handler
+    }
+
+    typealias FallbackHandler = (String, [String: Any], @escaping (Any?) -> Void) -> Void
+    private var fallbackHandler: FallbackHandler?
+
     /// True if a handler is registered under `name`. Useful for diagnostics
     /// and for `system.list_actions` introspection.
     func has(_ name: String) -> Bool {
