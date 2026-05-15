@@ -93,5 +93,7 @@ private extension String {
 }
 
 private extension Character {
-    var isASCIIDigit: Bool { isASCII && isNumber }
+    var isASCIIDigit: Bool {
+        isASCII && isNumber
+    }
 }

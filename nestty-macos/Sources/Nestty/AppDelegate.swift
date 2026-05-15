@@ -88,7 +88,63 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // back. Re-publishing here would double-fire.
             client.forward(method: method, params: params, completion: completion)
         }
-        daemonClient?.start()
+        // PR3: install invoke handler BEFORE start() so the very first inbound
+        // Invoke (e.g. heartbeat-adjacent or daemon-fired immediately after
+        // register ack) routes through handleCommand instead of being
+        // dropped. allowFallback=false prevents daemon→invoke→fallback→
+        // daemon recursion; silentCompletion=true prevents double-publishing
+        // <method>.completed (daemon already publishes for daemon-routed
+        // invokes).
+        daemonClient?.invokeHandler = { [weak self] id, method, params, reply in
+            guard let self else {
+                let line = (try? JSONSerialization.data(withJSONObject: [
+                    "id": id, "ok": false,
+                    "error": ["code": "internal_error", "message": "AppDelegate gone"],
+                ])).flatMap { String(data: $0, encoding: .utf8) }.map { $0 + "\n" }
+                if let line { reply(line) }
+                return
+            }
+            handleCommand(method: method, params: params, allowFallback: false, silentCompletion: true) { result in
+                // Result encoding (codex PR3 cross-review C1):
+                //   - RPCError → wire error envelope
+                //   - nil → unknown_method (legacy handlers + the daemon-
+                //     invoke `allowFallback:false` arm both `completion(nil)`
+                //     when no handler exists OR when a required param is
+                //     missing — encoding nil as ok:true would let those
+                //     surface as silent successes daemon-side)
+                //   - any other value → ok:true with payload (objects round-
+                //     trip as-is; non-object values wrapped in an array via
+                //     JSONSerialization fallback below)
+                let payload: [String: Any] = if let err = result as? RPCError {
+                    ["id": id, "ok": false, "error": ["code": err.code, "message": err.message]]
+                } else if let result {
+                    ["id": id, "ok": true, "result": result]
+                } else {
+                    ["id": id, "ok": false, "error": ["code": "unknown_method", "message": "no handler returned a value for \(method)"]]
+                }
+                if
+                    let data = try? JSONSerialization.data(withJSONObject: payload),
+                    let s = String(data: data, encoding: .utf8)
+                {
+                    reply(s + "\n")
+                } else {
+                    // codex round-2 cross-review I1: never silently drop a
+                    // reply. Daemon would wait until its method timeout,
+                    // and the invoke admission slot would only release on
+                    // the 125s safety net. Send an explicit internal_error
+                    // so daemon completes its pending entry fast.
+                    let fallback = "{\"id\":\"\(id)\",\"ok\":false,\"error\":{\"code\":\"internal_error\",\"message\":\"failed to encode response for \(method)\"}}\n"
+                    reply(fallback)
+                }
+            }
+        }
+        // PR3 cross-review C2: deliberately do NOT call `daemonClient?.start()`
+        // here. Now that PR3 routes inbound Invokes through `handleCommand`,
+        // an Invoke arriving immediately after `gui.register` ack would hit
+        // `guard let vc = tabVC` and false-return through the `unknown_method`
+        // path. Defer start until after `tabVC` is constructed (further
+        // below). Handler is set above so the very first inbound Invoke
+        // post-start is routed correctly.
 
         let config = NesttyConfig.load()
         let theme = NesttyTheme.byName(config.themeName) ?? .catppuccinMocha
@@ -180,6 +236,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         startSocketServer()
         startConfigWatcher()
         vc.openInitialTab()
+
+        // PR3 cross-review round 2 C1: daemon client must start AFTER the
+        // initial tab exists. PR2 startup ordering put `daemonClient.start()`
+        // just after `tabVC = vc`, which was correct as long as Invokes
+        // were dropped (PR2 GUI-owned guard). PR3 routes Invokes through
+        // `handleCommand`, where GUI-owned methods like `tab.list` /
+        // `terminal.exec` / `split.*` resolve against the active pane —
+        // the daemon could fire one between window-make-key and
+        // openInitialTab and get back empty/no-op success. Defer start
+        // until the tab exists so the GUI-owned method universe is real.
+        daemonClient?.start()
 
         if let path = config.backgroundPath {
             vc.applyBackground(path: path, tint: config.backgroundTint, opacity: config.backgroundOpacity)
@@ -574,13 +641,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         socketServer.start()
     }
 
-    private func handleCommand(method: String, params: [String: Any], completion: @escaping (Any?) -> Void) {
+    /// PR3: `allowFallback` and `silentCompletion` were added so daemon-
+    /// originated Invokes can call the same handler chain without recursing
+    /// (allowFallback=false → miss returns local `unknown_method` instead
+    /// of forwarding back to daemon) and without double-publishing
+    /// `<method>.completed` (daemon already publishes for daemon-routed
+    /// invokes — see ActionRegistry.tryDispatch silentCompletion). Default
+    /// values preserve socket-server behavior.
+    private func handleCommand(
+        method: String,
+        params: [String: Any],
+        allowFallback: Bool = true,
+        silentCompletion: Bool = false,
+        completion: @escaping (Any?) -> Void,
+    ) {
         // Registry takes precedence over the legacy switch — PR 3 (plugin
         // supervisor) and PR 5 (trigger engine) register their handlers
         // here. tryDispatch returns false when nothing's registered under
         // `method`, in which case completion is untouched and we fall
         // through to the hardcoded handlers below.
-        if actionRegistry.tryDispatch(method, params: params, completion: completion) {
+        if actionRegistry.tryDispatch(method, params: params, silentCompletion: silentCompletion, completion: completion) {
             return
         }
 
@@ -1086,11 +1166,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         default:
             // PR 2: legacy switch missed → ActionRegistry fallback handler
             // forwards to daemon (or returns daemon_unavailable / unknown_method).
-            // Codex round 3 C1 explicitly requires this ordering: registry →
-            // legacy switch → fallback. GUI-owned methods that fall here would
-            // bounce to daemon and back via Invoke (PR3 not yet); DaemonClient's
-            // `isGuiOwned` guard catches them and returns unknown_method fast.
-            actionRegistry.tryDispatchOrFallback(method, params: params, completion: completion)
+            // PR 3: daemon-originated Invokes pass `allowFallback: false` so
+            // we don't recurse (daemon → invoke → fallback → forward → daemon
+            // → invoke → ...). Local `unknown_method` short-circuits the loop.
+            if allowFallback {
+                actionRegistry.tryDispatchOrFallback(method, params: params, completion: completion)
+            } else {
+                completion(RPCError(code: "unknown_method", message: "no local handler for \(method) (daemon-invoke path, fallback disabled)"))
+            }
         }
     }
 

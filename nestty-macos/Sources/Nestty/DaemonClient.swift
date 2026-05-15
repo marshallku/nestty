@@ -76,17 +76,10 @@ final class DaemonClient: @unchecked Sendable {
     /// (`<method>.completed` / `.failed`); daemon-side ActionRegistry handles
     /// that already, so re-publishing here would double-fire.
     ///
-    /// **GUI-owned guard** (PR2 only, removed when PR3 lands Invoke routing):
-    /// methods owned by the GUI (`tab.*`, `split.*`, `terminal.*`, etc.)
-    /// are rejected immediately with `unknown_method`. If forwarded, the
-    /// daemon would route them back via `Invoke`, which PR2 ignores —
-    /// caller would block until per-request timeout. Better to fail fast.
+    /// PR3: GUI-owned methods are now safe to forward — daemon will Invoke
+    /// them back, the new `invokeHandler` routes through `handleCommand`,
+    /// and the Response flows back through `handleResponse` here.
     func forward(method: String, params: [String: Any], completion: @escaping (Any?) -> Void) {
-        if Self.isGuiOwned(method) {
-            completion(RPCError(code: "unknown_method", message: "GUI-owned method \(method) not callable via daemon forward (PR2 limitation)"))
-            return
-        }
-
         stateLock.lock()
         guard connected, let writerCh = currentWriter else {
             stateLock.unlock()
@@ -149,53 +142,56 @@ final class DaemonClient: @unchecked Sendable {
         let completion: (Any?) -> Void
     }
 
-    // MARK: - GUI-owned method guard (PR2 only)
+    // MARK: - Inbound Invoke handling (PR3)
 
-    /// Methods Nestty.app owns and must NOT be forwarded to daemon. Daemon's
-    /// dispatcher classifies these as GUI-owned and routes them back via
-    /// `Invoke` — which PR2 ignores, so the caller would just hang until
-    /// timeout (codex round 3 C1, cross-review round 2 C2, round 3 C1).
-    ///
-    /// **Mirror of `nestty-daemon/src/gui_registry.rs::method_capability`**.
-    /// Keep in lockstep — `theme.list` / `pane.*` / `agent.list` etc. are
-    /// daemon-owned (they should NOT be in this set) and were initially
-    /// blocked by mistake. PR3 will accept Invoke for these methods; this
-    /// guard becomes dead code at that point and should be removed.
-    private static let guiOwnedPrefixes: [String] = [
-        // Catch-all GUI capabilities (per gui_registry.rs:80-81)
-        "webview.", "background.",
-    ]
-    private static let guiOwnedExact: Set<String> = [
-        // tab capability
-        "tab.new", "tab.close", "tab.list", "tab.info", "tab.rename",
-        "tabs.toggle_bar", "claude.start",
-        // split
-        "split.horizontal", "split.vertical",
-        // terminal
-        "terminal.read", "terminal.state", "terminal.exec", "terminal.feed",
-        "terminal.history", "terminal.context",
-        // statusbar
-        "statusbar.show", "statusbar.hide", "statusbar.toggle",
-        // agent.ui (single method)
-        "agent.approve",
-        // session
-        "session.list", "session.info",
-        // plugin.open
-        "plugin.open",
-    ]
-    static func isGuiOwned(_ method: String) -> Bool {
-        if guiOwnedExact.contains(method) { return true }
-        for prefix in guiOwnedPrefixes where method.hasPrefix(prefix) {
-            return true
-        }
-        return false
-    }
+    /// Set by AppDelegate during launch (BEFORE `start()` so the first inbound
+    /// Invoke isn't dropped). Closure dispatches the daemon's invoke through
+    /// `AppDelegate.handleCommand` with `allowFallback: false`
+    /// (so daemon→GUI→daemon recursion is impossible) and
+    /// `silentCompletion: true` (so the local registry doesn't republish a
+    /// `<method>.completed` event that the daemon will publish itself —
+    /// PR4b will bridge that back via `_bus.publish`). The `reply` closure
+    /// writes the JSON Response line to our writer.
+    /// `@MainActor @Sendable`: closure body executes on main actor (so it
+    /// can call `AppDelegate.handleCommand` synchronously without a hop),
+    /// while the closure ref itself is Sendable (we store it on this
+    /// non-actor class). The wrapping Task in `admitInvoke` ensures the
+    /// invocation always lands on main.
+    typealias InvokeHandler = @MainActor @Sendable (_ id: String, _ method: String, _ params: [String: Any], _ reply: @Sendable @escaping (String) -> Void) -> Void
+    var invokeHandler: InvokeHandler?
+
+    /// Bounded admission for inbound Invokes — mirrors Linux's
+    /// `gui_client.rs` `POOL_QUEUE = 32`. Saturation → immediate `overloaded`
+    /// Response so the daemon's pending invoke completes fast instead of
+    /// waiting for its own 5s/120s timeout. Stale-generation invokes (queued
+    /// before a disconnect) also get an explicit `overloaded` response (codex
+    /// round 1 I1, round 2 confirmed).
+    private static let invokeQueueCap = 32
+    private var invokeInFlight = 0 // guarded by stateLock
 
     // MARK: - Constants
 
-    private static let requestTimeout: TimeInterval = 30.0
+    /// Frame cap mirrors `nestty-daemon::socket::read_line_capped` — 1 MiB
+    /// including the trailing newline (codex PR3 round 1 C3 + round 3 C1).
+    /// Reads beyond this immediately close the connection.
+    private static let maxFrameBytes = 1024 * 1024
+
     private static let backoffMin: TimeInterval = 0.1
     private static let backoffMax: TimeInterval = 5.0
+    /// Per-forward request timeout (caller waiting on `forward(...)`). Daemon
+    /// owns the daemon-side method timeout (`gui_registry.rs::method_invoke_timeout`,
+    /// 5s default / 120s for webview/claude.start). Our 30s is the GUI-side
+    /// safety belt for the forward path; if the daemon never replies in time
+    /// we fail-complete the caller.
+    private static let requestTimeout: TimeInterval = 30.0
+    /// Long safety net for inbound Invoke handler completion. Daemon's own
+    /// timeout fires sooner (5s/120s); the slot release here only protects
+    /// against a leaked slot if a handler closure never completes. 125s
+    /// matches Linux's `pump_timeout`. Daemon-side pending entry has already
+    /// failed by then — if our handler does eventually call back, the writer
+    /// `.send` will return false (channel shut down on reconnect) and the
+    /// reply is silently lost. Acceptable: daemon already gave up.
+    private static let invokeHandlerSafetyTimeout: TimeInterval = 125.0
 
     // MARK: - Run loop
 
@@ -314,12 +310,32 @@ final class DaemonClient: @unchecked Sendable {
                 break outer
             }
             buf.append(chunk, count: n)
-            // Line-split
-            while let nlIdx = buf.firstIndex(of: 0x0A) {
-                let lineData = buf.prefix(nlIdx)
-                buf.removeSubrange(0 ... nlIdx)
-                guard let line = String(data: lineData, encoding: .utf8), !line.trimmingCharacters(in: .whitespaces).isEmpty else { continue }
-                handleInboundLine(line, writer: session.writer)
+            // Line-split with frame cap. Mirrors `nestty-daemon::socket::
+            // read_line_capped` (1 MiB frame INCLUDING newline — codex round
+            // 3 C1 off-by-one fix). Two checks:
+            //   1. Frame length to next newline > cap → reject (close).
+            //   2. No newline AND buffer total > cap → reject (would never
+            //      assemble a valid frame).
+            // Only the offending frame closes the connection; small frames
+            // already in the buffer parse normally up to the offender.
+            while true {
+                if let nlIdx = buf.firstIndex(of: 0x0A) {
+                    let frameBytes = nlIdx + 1
+                    if frameBytes > Self.maxFrameBytes {
+                        log("frame cap exceeded (\(frameBytes) > \(Self.maxFrameBytes)) — closing connection")
+                        break outer
+                    }
+                    let lineData = buf.prefix(nlIdx)
+                    buf.removeSubrange(0 ... nlIdx)
+                    guard let line = String(data: lineData, encoding: .utf8), !line.trimmingCharacters(in: .whitespaces).isEmpty else { continue }
+                    handleInboundLine(line, writer: session.writer)
+                } else {
+                    if buf.count > Self.maxFrameBytes {
+                        log("partial frame exceeds cap (\(buf.count) > \(Self.maxFrameBytes)) — closing connection")
+                        break outer
+                    }
+                    break // need more bytes
+                }
             }
         }
         session.writer.shutdown()
@@ -338,8 +354,12 @@ final class DaemonClient: @unchecked Sendable {
             if invokeMethod == "_ping" {
                 replyToPing(value: value, writer: writer)
             } else {
-                // PR3: implement Invoke routing for tab.new, webview.*, etc.
-                log("ignoring Invoke (PR3): method=\(invokeMethod), id=\(value["id"] ?? "?")")
+                guard let id = value["id"] as? String else {
+                    log("Invoke missing id: method=\(invokeMethod) — dropping")
+                    return
+                }
+                let params = (value["params"] as? [String: Any]) ?? [:]
+                admitInvoke(id: id, method: invokeMethod, params: params)
             }
             return
         }
@@ -361,6 +381,97 @@ final class DaemonClient: @unchecked Sendable {
         let response: [String: Any] = ["id": id, "ok": true, "result": params]
         guard let line = encodeJSONLine(response) else { return }
         writer.sendControl(line) // priority lane — bypasses bounded forward queue
+    }
+
+    /// Admit an inbound Invoke through a bounded gate, then dispatch on the
+    /// main actor. Mirrors Linux `gui_client.rs` `POOL_QUEUE = 32` semantics:
+    /// saturation responds `overloaded` immediately; stale-generation invokes
+    /// (admitted before a disconnect) also respond `overloaded` so the daemon
+    /// completes its pending entry fast instead of waiting for its own
+    /// timeout (codex round 2 confirmed Linux writes overloaded on stale).
+    ///
+    /// **Slot lifetime** (codex round 2 C1, round 3 C2): the admission slot
+    /// holds for the *response*, not the Task body. Async handlers
+    /// (`webview.execute_js`, `claude.start`, `webview.screenshot`) call
+    /// completion later than the Task closure returns. A shared `SlotGuard`
+    /// ensures every terminal path — response, missing handler, encode
+    /// failure, stale-gen, safety-net timeout — releases the slot exactly
+    /// once.
+    private func admitInvoke(id: String, method: String, params: [String: Any]) {
+        stateLock.lock()
+        let admittedGen = generation
+        let writerSnapshot = currentWriter
+        if invokeInFlight >= Self.invokeQueueCap {
+            stateLock.unlock()
+            sendInvokeError(id: id, code: "overloaded", message: "GUI invoke queue saturated", writer: writerSnapshot)
+            return
+        }
+        invokeInFlight += 1
+        stateLock.unlock()
+
+        let slot = SlotGuard()
+        let releaseSlot: @Sendable () -> Void = { [weak self] in
+            guard slot.releaseOnce() else { return }
+            self?.stateLock.lock()
+            if let s = self { s.invokeInFlight = max(0, s.invokeInFlight - 1) }
+            self?.stateLock.unlock()
+        }
+
+        // Long safety net so a never-completing handler can't leak slots
+        // forever (codex C1). Daemon's own timeout fires sooner; if it
+        // does fire after, writer.send returns false (channel shut down)
+        // and the late reply is silently lost — daemon already gave up.
+        timeoutQueue.asyncAfter(deadline: .now() + Self.invokeHandlerSafetyTimeout) {
+            releaseSlot()
+        }
+
+        // Bridge non-Sendable params + writer ref across the @MainActor hop
+        // via SendableBox (existing project pattern — see SendableBox.swift).
+        // The race the type system warns about can't occur: params is
+        // produced once on the reader thread, consumed once on main, never
+        // shared. Same for the writer reference — admitInvoke owns the
+        // captured snapshot for this one Invoke.
+        let paramsBox = SendableBox(params)
+        let writerBox = SendableBox(writerSnapshot)
+        Task { @MainActor [weak self] in
+            guard let self else { releaseSlot(); return }
+            let curGen: UInt64 = {
+                self.stateLock.lock(); defer { self.stateLock.unlock() }
+                return self.generation
+            }()
+            if curGen != admittedGen {
+                // Connection recycled while we waited for the main actor.
+                // Daemon's pending entry already failed; tell daemon
+                // explicitly so it doesn't wait for its own timeout.
+                sendInvokeError(id: id, code: "overloaded", message: "GUI generation moved before dispatch", writer: writerBox.value)
+                releaseSlot()
+                return
+            }
+            guard let handler = invokeHandler else {
+                sendInvokeError(id: id, code: "internal_error", message: "DaemonClient invokeHandler not set", writer: writerBox.value)
+                releaseSlot()
+                return
+            }
+            handler(id, method, paramsBox.value) { responseLine in
+                _ = writerBox.value?.send(responseLine)
+                releaseSlot()
+            }
+        }
+    }
+
+    /// Build + send an error Response for failures inside the Invoke admission
+    /// path. `writer` may be nil if the connection died between admission and
+    /// the failure observation; in that case the daemon already failed its
+    /// pending entry on disconnect, so silent drop is acceptable.
+    private func sendInvokeError(id: String, code: String, message: String, writer: WriterChannel?) {
+        guard let writer else { return }
+        let resp: [String: Any] = [
+            "id": id,
+            "ok": false,
+            "error": ["code": code, "message": message],
+        ]
+        guard let line = encodeJSONLine(resp) else { return }
+        _ = writer.send(line)
     }
 
     private func handleResponse(id: String, value: [String: Any]) {
@@ -463,10 +574,31 @@ final class DaemonClient: @unchecked Sendable {
         return true
     }
 
+    /// Single-line blocking read. Used by `registerOn` for the synchronous
+    /// register-ack handshake. **Frame-capped** at `maxFrameBytes` mirroring
+    /// `nestty-daemon::socket::read_line_capped` and the runReader loop —
+    /// a malicious or runaway daemon can't OOM Nestty.app via the register
+    /// channel either (codex round 1 I2 — register ack capped on Linux too).
+    /// Returns nil on EOF, error, or oversized frame.
+    ///
+    /// **Cap semantic** (codex PR3 cross-review C3): `maxFrameBytes` includes
+    /// the trailing newline (matching the runReader loop's `nlIdx + 1` check
+    /// and Linux's `read_line_capped`). After appending each byte, if the
+    /// buffer length equals or exceeds `maxFrameBytes` AND the just-read
+    /// byte was NOT the newline, the next byte would push over cap → reject.
     private func readLine(fd: Int32) -> String? {
         var buf = Data()
         var byte: UInt8 = 0
         while true {
+            // Reject when accepting another non-newline byte would push the
+            // (payload + newline) frame past cap. `buf.count + 1 > cap`
+            // catches the case where buf already has cap-1 bytes — adding
+            // a newline next would land at exactly cap (acceptable), but
+            // adding any non-newline byte would push past.
+            if buf.count >= Self.maxFrameBytes {
+                log("registerOn: read frame exceeded cap (\(buf.count) >= \(Self.maxFrameBytes)) — aborting register")
+                return nil
+            }
             let n = withUnsafeMutablePointer(to: &byte) { p -> Int in
                 Darwin.read(fd, p, 1)
             }
@@ -502,6 +634,25 @@ struct RegisterAck {
 private struct Session {
     let fd: Int32
     let writer: WriterChannel
+}
+
+/// Idempotent one-shot release flag. `releaseOnce()` returns `true` exactly
+/// once across concurrent calls; subsequent calls return `false`. Used by
+/// `admitInvoke` to ensure each Invoke admission slot is decremented exactly
+/// once across the racing terminal paths (handler completion, safety-timeout,
+/// error early-out — codex round 3 C2).
+///
+/// NSLock-backed (codex Q1: don't add Swift Atomics for one guard).
+final class SlotGuard: @unchecked Sendable {
+    private let lock = NSLock()
+    private var released = false
+
+    func releaseOnce() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if released { return false }
+        released = true
+        return true
+    }
 }
 
 /// Bounded normal-forward queue + unbounded control queue (for `_ping` replies

@@ -143,10 +143,17 @@ final class ActionRegistry {
     func tryDispatch(
         _ method: String,
         params: [String: Any],
+        silentCompletion: Bool = false,
         completion: @escaping (Any?) -> Void,
     ) -> Bool {
         guard let entry = entries[method] else { return false }
-        let bus = entry.silent ? nil : eventBus
+        // PR3: `silentCompletion` lets daemon-routed invokes suppress local
+        // fan-out — daemon-side ActionRegistry already publishes
+        // `<method>.completed` (PR7), and PR4b will bridge those events back
+        // through DaemonClient. Republishing here would double-fire.
+        // Mirrors Linux's `silent_completion: true` flag in `gui_client.rs`'s
+        // GuiInvokeJob dispatch path.
+        let bus = (entry.silent || silentCompletion) ? nil : eventBus
         let wrapped: (Any?) -> Void = { [weak bus] value in
             if let bus {
                 Self.publishCompletion(bus: bus, method: method, value: value)
