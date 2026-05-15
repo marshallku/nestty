@@ -301,12 +301,17 @@ mod tests {
     #[test]
     fn system_spawn_executes_program_and_reports_pid() {
         let (_r, sink, rx) = mk_sink_with_registry();
-        // /bin/true exits 0, exists on every Linux/macOS dev box; the
-        // intent here is to assert the spawn path returns Ok with a
-        // pid AND does NOT fall through to socket::dispatch (rx
-        // empty).
+        // `true` exits 0; intent is to assert the spawn path returns
+        // Ok with a pid AND does NOT fall through to socket::dispatch
+        // (rx empty). Linux ships `/bin/true`; macOS ships only
+        // `/usr/bin/true` (no `/bin/true` symlink), so probe both.
+        let true_path = if std::path::Path::new("/bin/true").exists() {
+            "/bin/true"
+        } else {
+            "/usr/bin/true"
+        };
         let r = sink
-            .dispatch_action("system.spawn", json!({ "argv": ["/bin/true"] }))
+            .dispatch_action("system.spawn", json!({ "argv": [true_path] }))
             .unwrap();
         assert_eq!(r["queued"], json!(true));
         assert!(r["pid"].as_u64().unwrap() > 0);

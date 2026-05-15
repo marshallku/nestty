@@ -84,6 +84,40 @@ swift build              # 빌드만
 
 **Info.plist 중복:** `run.sh`와 `install-macos.sh`가 동일 Info.plist를 인라인으로 포함합니다. 두 카피는 의도된 상태 (Rule of Three: 2회는 OK). 세 번째가 생기면 그때 템플릿화.
 
+### `nesttyd` 수동 실행 (PR 1 / daemon-first migration prep)
+
+Linux는 daemon-first가 default(`83c5122`); macOS는 monolithic 상태에서 daemon migration 진행 중(`docs/macos-daemon-migration-plan.md`). PR 1에서는 `nesttyd`를 수동으로 띄워 nestctl로 호출하는 흐름까지만 검증합니다 (Nestty.app은 아직 daemon에 연결되지 않음).
+
+```bash
+# 1. daemon 빌드
+cargo build --release -p nestty-daemon
+cargo build --release -p nestty-cli   # nestctl
+
+# 2. daemon 띄우기 (foreground; 별도 터미널 권장)
+target/release/nesttyd
+
+# 3. 다른 터미널에서 nestctl로 호출 — Nestty.app이 떠 있으면 nestctl 디스커버리가
+#    GUI 소켓을 먼저 잡을 수 있어 모놀리식 GUI로 라우팅됩니다. PR 1에서는 daemon
+#    경로를 검증하는 게 목적이므로 --socket 또는 NESTTY_SOCKET으로 daemon 소켓을
+#    명시합니다.
+DAEMON_SOCK="$HOME/Library/Caches/nestty/socket"
+
+target/release/nestctl --socket "$DAEMON_SOCK" call system.ping
+# {"status": "ok"}
+
+target/release/nestctl --socket "$DAEMON_SOCK" call system.list_actions
+# {"count": 44, "names": [...]}  ← 9개 first-party plugin이 daemon-side에서 spawn됨
+
+# 4. 종료
+pkill -x nesttyd
+```
+
+소켓 경로: `~/Library/Caches/nestty/socket` (perms `0600`, `nestty-core::paths::daemon_socket_path()` 결정). 디렉토리는 daemon이 첫 실행 시 생성. 종료 후 socket inode가 남지만 다음 daemon 시작 시 unbind/rebind 됩니다.
+
+PR 2에서 `Nestty.app`이 정식 daemon client가 되면 GUI 소켓도 daemon으로 forward되므로 `--socket` 명시 없이 동일 동작이 보장됩니다. PR 1 단계에선 두 소켓이 별도 프로세스를 가리키므로 명시가 필수.
+
+이후 PR(2~)에서 `Nestty.app`이 `~/Library/Caches/nestty/socket`을 향해 자동 connect + auto-spawn하도록 확장합니다 (`docs/macos-daemon-migration-plan.md` 참조).
+
 ### Rust FFI (`nestty-ffi` + `CNesttyFFI`)
 
 PR 1 / Tier 2.1 spike. macOS 앱이 shared Rust core(`nestty-core`의 trigger engine, supervisor 등)를 향후 사용하려면 Swift ↔ Rust C-ABI 다리가 필요합니다. SwiftPM은 cargo를 prebuild로 직접 호출할 방법이 없어서 빌드 파이프라인이 두 단계로 갈라집니다:
