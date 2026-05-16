@@ -30,6 +30,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Bridges Cmd/Option + Backspace/Delete to readline control bytes — see
     /// `installEditKeyMonitor()` for why this can't be done inside SwiftTerm.
     private var editKeyMonitor: Any?
+    /// Cmd+Shift+P palette controller. Held for the sheet's lifetime —
+    /// `NSTableView` data source / delegate are unowned references, so a
+    /// transient stack-only controller would deallocate the moment `open`
+    /// returns and the table would go blank. Cleared from `endSheet`
+    /// completion in `CommandPaletteController.open`.
+    private var commandPaletteController: CommandPaletteController?
     /// Constructed inside `applicationDidFinishLaunching`. Background
     /// reconnect loop is owned by the client.
     private var daemonClient: DaemonClient?
@@ -583,8 +589,70 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 Keybindings.dispatch(binding, registry: actionRegistry, socketPath: socketServer.path)
                 return nil
             }
+            if matchesCommandPaletteShortcut(event), openCommandPalette() {
+                return nil
+            }
             return event
         }
+    }
+
+    /// Cmd+Shift+P, mac convention (VSCode/Zed). User keybindings already
+    /// run before this — a `cmd+shift+p` entry in `[keybindings]` shadows
+    /// the palette, mirroring Linux's "user binding wins" precedence.
+    ///
+    /// `keyCode == kVK_ANSI_P` (0x23) is matched on physical key position
+    /// rather than `charactersIgnoringModifiers` because non-Latin IMEs
+    /// (Korean, Japanese, …) translate `p` into the IME's character
+    /// (e.g. Korean `ㅖ`) before the event reaches us, breaking a
+    /// character-based match. The keyCode is layout-position-based and
+    /// IME-immune.
+    private func matchesCommandPaletteShortcut(_ event: NSEvent) -> Bool {
+        let interesting: NSEvent.ModifierFlags = [.command, .control, .shift, .option]
+        let mods = event.modifierFlags.intersection(interesting)
+        guard mods == [.command, .shift] else { return false }
+        return event.keyCode == 0x23
+    }
+
+    /// Returns true when the palette opened (event must be swallowed).
+    /// Repeats and re-entry while a sheet is already attached return false
+    /// so the held key doesn't stack modal state. `attachedSheet` covers
+    /// the destructive-confirm alert window: when palette closes and the
+    /// `tab.close` alert opens, `commandPaletteController` is already nil
+    /// but the window still has the alert sheet attached — a second
+    /// `beginSheet` would break the modal invariant.
+    @MainActor
+    private func openCommandPalette() -> Bool {
+        guard
+            let win = window,
+            commandPaletteController == nil,
+            win.attachedSheet == nil
+        else { return false }
+        let actions = CommandPalette.collectActions(registry: actionRegistry)
+        let restore = win.firstResponder
+        let controller = CommandPaletteController(
+            parentWindow: win,
+            actions: actions,
+            restoreFocus: restore,
+            dispatch: { [weak self] method in
+                self?.handleCommand(method: method, params: [:]) { result in
+                    // Legacy switch arms `completion(nil)` for missing
+                    // params (e.g. `terminal.exec`, `tab.rename`); surface
+                    // those as a usable hint instead of silent no-op so
+                    // palette users learn the action needs params.
+                    if let err = result as? RPCError {
+                        FileHandle.standardError.write(Data("[nestty] command_palette: \(method) failed: \(err.code) — \(err.message)\n".utf8))
+                    } else if result == nil {
+                        FileHandle.standardError.write(Data("[nestty] command_palette: \(method) returned no result — action likely needs params (palette dispatches with empty {})\n".utf8))
+                    }
+                }
+            },
+            onClose: { [weak self] in
+                self?.commandPaletteController = nil
+            },
+        )
+        commandPaletteController = controller
+        controller.open()
+        return true
     }
 
     /// SwiftTerm's `MacTerminalView.doCommand(by:)` only handles a subset of

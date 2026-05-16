@@ -247,14 +247,19 @@ macOS Nestty.app은 nestty-linux의 `gui_client.rs`와 동일한 daemon client. 
 
 ---
 
-### PR 6 — Cmd+Shift+P command palette port
+### PR 6 — Cmd+Shift+P command palette port [DONE]
 
 **Goal:** `f8a77c8` "Add Ctrl+Shift+P command palette over ActionRegistry"의 macOS 포트.
 
-- 새 `CommandPalette.swift` modal NSPanel
-- Daemon-registered actions를 `system.list_actions`로 가져와 fuzzy filter
-- Enter 시 `actionRegistry.tryDispatch` (daemon으로 routing)
-- Tests: unit on filter; e2e
+- 새 `CommandPalette.swift` (`CommandPaletteController` + filter helpers)
+- Action surface = `actionRegistry.names()` ∪ macOS-local `LEGACY_DISPATCH_METHODS` 미러 (handleCommand switch arms)
+- Cmd+Shift+P (mac convention, not Ctrl+Shift+P) — keyCode-based match (IME-immune; Korean/JP IME가 char `p`를 자기 문자로 번역해 char-match 깨지는 거 방지)
+- Enter 시 `handleCommand`로 라우팅 (registry hit → legacy switch → daemon fallback 모두 커버)
+- Destructive guard: `tab.close` NSAlert with Cancel-default + Cancel-on-stray-Enter (Linux decision 29 미러)
+- Focus restore: Esc/Cancel 경로에만 (post-dispatch는 action 자체에 위임 — `tab.close`/`tab.new`/`split.*`가 active view 자체를 변형하므로 stale responder 복원 시 crash/conflict)
+- Re-entry guard: `commandPaletteController != nil` 체크로 holding-key가 sheet 쌓는 것 방지
+- v1 limitations: empty params only; param-required actions는 stderr `invalid_params` (Linux와 동일)
+- Tests: e2e via AppleScript — 열기/system.ping 디스패치/destructive guard cancel/Esc 닫힘/re-entry guard 확인
 
 ---
 

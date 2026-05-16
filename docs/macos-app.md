@@ -421,6 +421,8 @@ nestctl call system.ffi_test --params '{"hello":"x"}'
 
 `ActionRegistry`는 Linux full surface(`register_silent` / `register_blocking` / `invoke` / `try_invoke` / completion bus)의 일부만 가져옴. `register_blocking`은 의도적으로 보류 — Linux는 dispatch 즉시 리턴 후 worker thread에서 blocking 핸들러 실행하지만, macOS 소켓 dispatch가 main-actor completion 까지 socket thread를 세마포어로 잡아두는 모델이라 섞으면 데드락 위험 있음. PR 5에서 트리거 엔진 wiring할 때 async boundary 다시 설계.
 
+**Command Palette (PR 6 / daemon-migration)** — Cmd+Shift+P로 `NSWindow` sheet 열기. `CommandPaletteController`가 `NSSearchField` + `NSTableView`를 들고 있으며, AppKit이 data source/delegate를 unowned로 잡으므로 `AppDelegate.commandPaletteController` ivar에서 sheet lifetime 내내 retain. shortcut match는 `event.keyCode == 0x23` (`kVK_ANSI_P`) — non-Latin IME(Korean/JP)가 char `p`를 자기 문자로 번역해서 char-match가 깨지는 거 회피. 액션 surface = `actionRegistry.names()` ∪ `CommandPalette.macOSLegacyMethods` (handleCommand switch arms 미러 — daemon쪽 `LEGACY_DISPATCH_METHODS`와 다름: macOS는 `tab.switch`, `pane.focus_*`, `terminal.shell_*`, `webview.state` 추가 보유). Enter는 `handleCommand`로 라우팅해서 registry → legacy switch → daemon fallback 순으로 적중. `tab.close`는 `NSAlert` Cancel-default + Cancel-on-stray-Enter (Linux `command_palette` decision 29 미러). post-dispatch focus restore는 안 함 — `tab.close`/`tab.new`/`split.*`가 active view를 변형하므로 stale responder 복원이 crash/conflict.
+
 ### TabViewController.swift (`@MainActor`)
 
 탭 목록을 `[PaneManager]`로 관리. `contentArea`에 현재 탭의 `containerView`를 embed합니다.
