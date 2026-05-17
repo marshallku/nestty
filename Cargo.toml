@@ -16,6 +16,9 @@ members = [
     "plugins/discord",
     "plugins/bookmark",
     "plugins/jira",
+    # Phase 0 throwaway. Delete with `spikes/macos-renderer-spike/` when
+    # Phase 0 signs off and Phase 1's real `nestty-term/` lands.
+    "spikes/macos-renderer-spike",
 ]
 
 [workspace.package]

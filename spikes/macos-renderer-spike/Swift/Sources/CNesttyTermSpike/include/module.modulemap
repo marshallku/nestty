@@ -1,0 +1,4 @@
+module CNesttyTermSpike {
+    header "nestty_term_spike.h"
+    export *
+}

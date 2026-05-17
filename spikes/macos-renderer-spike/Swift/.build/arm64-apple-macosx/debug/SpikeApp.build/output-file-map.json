@@ -1,0 +1,12 @@
+{
+  "": {
+    "swift-dependencies": "/Users/marshallku/dev/turm/spikes/macos-renderer-spike/Swift/.build/arm64-apple-macosx/debug/SpikeApp.build/master.swiftdeps"
+  },
+  "/Users/marshallku/dev/turm/spikes/macos-renderer-spike/Swift/Sources/SpikeApp/main.swift": {
+    "dependencies": "/Users/marshallku/dev/turm/spikes/macos-renderer-spike/Swift/.build/arm64-apple-macosx/debug/SpikeApp.build/main.d",
+    "object": "/Users/marshallku/dev/turm/spikes/macos-renderer-spike/Swift/.build/arm64-apple-macosx/debug/SpikeApp.build/main.swift.o",
+    "swiftmodule": "/Users/marshallku/dev/turm/spikes/macos-renderer-spike/Swift/.build/arm64-apple-macosx/debug/SpikeApp.build/main~partial.swiftmodule",
+    "swift-dependencies": "/Users/marshallku/dev/turm/spikes/macos-renderer-spike/Swift/.build/arm64-apple-macosx/debug/SpikeApp.build/main.swiftdeps",
+    "diagnostics": "/Users/marshallku/dev/turm/spikes/macos-renderer-spike/Swift/.build/arm64-apple-macosx/debug/SpikeApp.build/main.dia"
+  }
+}
