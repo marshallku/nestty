@@ -10,10 +10,14 @@ repository.workspace = true
 name = "nestty_term"
 # staticlib so libnestty_term.a embeds into Nestty.app at link time
 # alongside the existing libnestty_ffi.a — proven not to collide by
-# the Phase 0 spike.
-crate-type = ["staticlib"]
+# the Phase 0 spike. `rlib` lets Rust integration tests link the
+# crate normally (without it, tests can't `use nestty_term::*`).
+crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-# Phase 2 will add `alacritty_terminal`. Kept dependency-free for
-# Phase 1 so the scaffold lands without dragging in a large
-# transitive tree that would complicate review.
+# Pinned to a specific minor version because Alacritty maintainers
+# don't support external use of this crate as a library
+# (alacritty/alacritty#2132). Bumping requires re-verifying the
+# `tty::new` + `EventLoop::new` + `Term::renderable_content` API
+# shape; see decision #31 R1.
+alacritty_terminal = "0.26"

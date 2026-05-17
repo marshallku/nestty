@@ -1,34 +1,46 @@
-//! C-ABI bridge from a future `alacritty_terminal::Term` to
-//! `nestty-macos`'s renderer (and eventually any other host that needs
-//! a fully-functional terminal emulator core).
+//! C-ABI bridge wrapping `alacritty_terminal::Term` + its PTY event
+//! loop. Consumers are `nestty-macos`'s renderer for now; the FFI is
+//! deliberately host-agnostic so other UIs can attach later.
 //!
-//! Phase 1 ships the FFI surface from
-//! `docs/macos-renderer-migration-plan.md` §D3 with stubbed bodies —
-//! a fixture row matching the Phase 0 spike's coverage of the
-//! interesting render cases (red text, inverse, wide CJK, ZWJ emoji,
-//! ligature input with underline color override). Phase 2 will
-//! replace the fixture data with `alacritty_terminal::Term` snapshots
-//! sourced from a real PTY.
+//! See `docs/macos-renderer-migration-plan.md` §D3 for the ABI
+//! contract and §Phase 2 for what's wired here.
 //!
-//! All pointers returned across the boundary follow these rules:
+//! Pointer ownership:
 //!
 //! - `*mut NesttyHandle` / `*mut NesttySnapshot` — heap allocations
-//!   owned by Rust. Must be freed by their matching `_destroy`
-//!   function exactly once. Passing NULL to `_destroy` is a no-op.
+//!   owned by Rust; free with the matching `_destroy` function
+//!   exactly once. Passing NULL to `_destroy` is a no-op.
 //! - Borrowed `*const NesttyRun` / `*const u8` from snapshot
-//!   accessors — valid until `nestty_snapshot_destroy`. The Swift
-//!   caller must not retain these past the snapshot's lifetime.
+//!   accessors — valid until `nestty_snapshot_destroy`.
 //! - Static strings (`nestty_term_version`) — valid for program
 //!   lifetime, no free required.
+//!
+//! Threading: `Arc<FairMutex<Term>>` is shared between the PTY reader
+//! thread (alacritty's `EventLoop`) and snapshot callers. Snapshots
+//! lock briefly, copy out the visible rows, then release; renderers
+//! consume them without holding the lock.
 
 use std::ffi::{CStr, c_char};
+use std::path::PathBuf;
 use std::ptr;
+use std::sync::Arc;
+use std::thread::JoinHandle;
 
-/// Run-oriented cell attribute block. `#[repr(C)]` so Swift sees the
-/// same layout. Per-cell allocation is avoided by indexing into the
-/// row's contiguous utf8 buffer via `utf8_offset` + `utf8_len`.
-///
-/// Layout MUST match `nestty-macos/Sources/CNesttyTerm/include/nestty_term.h`.
+use alacritty_terminal::event::{VoidListener, WindowSize};
+use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State};
+use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::sync::FairMutex;
+use alacritty_terminal::term::cell::Flags as CellFlags;
+use alacritty_terminal::term::test::TermSize;
+use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::tty::{self, Options as TtyOptions, Pty, Shell};
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
+
+/// Mirrors §D3 of the migration plan. `#[repr(C)]` so the layout is
+/// stable across the FFI boundary. Per-cell allocation is avoided by
+/// referencing into the row's contiguous utf8 buffer via
+/// `utf8_offset` + `utf8_len`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct NesttyRun {
@@ -57,14 +69,13 @@ pub mod flags {
     pub const WIDE_TRAILING: u16 = 1 << 8;
 }
 
-/// Cursor position + style. Reported via `nestty_snapshot_cursor`.
+/// Cursor position + style reported by `nestty_snapshot_cursor`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct NesttyCursor {
     pub row: u16,
     pub col: u16,
-    /// 0=hidden 1=block 2=bar 3=underline (steady/blink encoded in `blink`)
-    pub style: u8,
+    pub style: u8, // 0=hidden 1=block 2=bar 3=underline
     pub blink: u8,
     pub _reserved: u16,
 }
@@ -74,12 +85,17 @@ struct Row {
     runs: Vec<NesttyRun>,
 }
 
-/// Phase 1 stub. Holds geometry and a fixture-data flag for the
-/// initial smoke test; Phase 2 will replace this with a wrapper
-/// around `alacritty_terminal::Term` + PTY thread.
 pub struct NesttyHandle {
-    cols: u16,
-    rows: u16,
+    /// Shared between the PTY reader thread (alacritty's EventLoop)
+    /// and snapshot callers. Lock duration must stay short on the
+    /// snapshot path so the reader thread isn't starved.
+    term: Arc<FairMutex<Term<VoidListener>>>,
+    /// Sender into the event loop's mpsc — drives input writes,
+    /// resize, and shutdown.
+    sender: EventLoopSender,
+    /// Reader thread that owns the PTY + parser loop. Joined in
+    /// `nestty_term_destroy` after sending `Msg::Shutdown`.
+    io_thread: Option<JoinHandle<(EventLoop<Pty, VoidListener>, State)>>,
 }
 
 pub struct NesttySnapshot {
@@ -88,23 +104,75 @@ pub struct NesttySnapshot {
     cursor: NesttyCursor,
 }
 
-/// Create a terminal handle. Phase 1 stub — `shell` and `cwd` are
-/// accepted for API compatibility but unused (no PTY spawn yet).
+/// Create a terminal handle: spawn a PTY running the requested shell
+/// (or the user's `$SHELL`), construct an `alacritty_terminal::Term`
+/// at the given size, hand both to an `EventLoop` running in a
+/// dedicated thread. Returns NULL on shell-spawn failure (e.g. shell
+/// path missing).
 ///
 /// # Safety
 ///
-/// `shell` and `cwd` may be NULL or valid C strings.
+/// `shell` and `cwd` may be NULL or point to valid C strings. They
+/// are copied; caller retains ownership.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nestty_term_create(
     cols: u16,
     rows: u16,
-    _shell: *const c_char,
-    _cwd: *const c_char,
+    shell: *const c_char,
+    cwd: *const c_char,
 ) -> *mut NesttyHandle {
-    Box::into_raw(Box::new(NesttyHandle { cols, rows }))
+    let safe_cols = cols.max(1);
+    let safe_rows = rows.max(1);
+
+    let mut tty_opts = TtyOptions::default();
+    if !shell.is_null() {
+        // SAFETY: caller contract — non-null pointer is a NUL-terminated C string.
+        if let Ok(s) = unsafe { CStr::from_ptr(shell) }.to_str() {
+            tty_opts.shell = Some(Shell::new(s.to_owned(), Vec::new()));
+        }
+    }
+    if !cwd.is_null() {
+        if let Ok(s) = unsafe { CStr::from_ptr(cwd) }.to_str() {
+            tty_opts.working_directory = Some(PathBuf::from(s));
+        }
+    }
+
+    let window_size = WindowSize {
+        num_lines: safe_rows,
+        num_cols: safe_cols,
+        // Cell pixel dims are only used by programs that query
+        // `TIOCGWINSZ` for pixel dimensions (mostly image protocols
+        // like sixel/kitty). 1×1 is safe for the headless scaffold;
+        // the renderer will resize with real values once it's drawing.
+        cell_width: 1,
+        cell_height: 1,
+    };
+
+    let pty = match tty::new(&tty_opts, window_size, 0) {
+        Ok(p) => p,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let term_size = TermSize::new(safe_cols as usize, safe_rows as usize);
+    let term = Term::new(Config::default(), &term_size, VoidListener);
+    let term = Arc::new(FairMutex::new(term));
+
+    let event_loop = match EventLoop::new(Arc::clone(&term), VoidListener, pty, false, false) {
+        Ok(el) => el,
+        Err(_) => return ptr::null_mut(),
+    };
+    let sender = event_loop.channel();
+    let io_thread = event_loop.spawn();
+
+    Box::into_raw(Box::new(NesttyHandle {
+        term,
+        sender,
+        io_thread: Some(io_thread),
+    }))
 }
 
-/// Free a handle. Safe to pass NULL.
+/// Free a handle. Sends `Msg::Shutdown`, joins the reader thread,
+/// drops the Term. Safe to pass NULL.
 ///
 /// # Safety
 ///
@@ -114,130 +182,212 @@ pub unsafe extern "C" fn nestty_term_destroy(handle: *mut NesttyHandle) {
     if handle.is_null() {
         return;
     }
-    let _ = unsafe { Box::from_raw(handle) };
+    let mut handle = unsafe { Box::from_raw(handle) };
+    // Best-effort shutdown — if the reader already exited (e.g. PTY
+    // child died), the send fails but join still cleans up.
+    let _ = handle.sender.send(Msg::Shutdown);
+    if let Some(jh) = handle.io_thread.take() {
+        let _ = jh.join();
+    }
 }
 
-/// Phase 1 stub — accepts input bytes but doesn't route to a PTY yet.
+/// Feed input bytes to the PTY. The reader thread picks them up via
+/// the event-loop channel.
 ///
 /// # Safety
 ///
 /// `bytes` must point to `len` readable bytes (or be NULL when len=0).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn nestty_term_input(_handle: *mut NesttyHandle, _bytes: *const u8, _len: usize) {
+pub unsafe extern "C" fn nestty_term_input(handle: *mut NesttyHandle, bytes: *const u8, len: usize) {
+    let Some(h) = (unsafe { handle.as_ref() }) else { return };
+    if len == 0 || bytes.is_null() {
+        return;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(bytes, len) };
+    let _ = h.sender.send(Msg::Input(slice.to_vec().into()));
 }
 
-/// Phase 1 stub — Phase 2 will resize the PTY + Term grid.
+/// Resize the PTY + Term grid. `cell_width`/`cell_height` left at 1
+/// since this FFI is headless; real pixel sizes land when a renderer
+/// attaches.
 #[unsafe(no_mangle)]
 pub extern "C" fn nestty_term_resize(handle: *mut NesttyHandle, cols: u16, rows: u16) {
-    if let Some(h) = unsafe { handle.as_mut() } {
-        h.cols = cols;
-        h.rows = rows;
-    }
+    let Some(h) = (unsafe { handle.as_ref() }) else { return };
+    let safe_cols = cols.max(1);
+    let safe_rows = rows.max(1);
+
+    let ws = WindowSize {
+        num_lines: safe_rows,
+        num_cols: safe_cols,
+        cell_width: 1,
+        cell_height: 1,
+    };
+    // `Msg::Resize` only forwards to `pty.on_resize` (so the child
+    // process sees SIGWINCH). The Term grid is a separate resize and
+    // must be done explicitly under the term lock — alacritty's own
+    // app does this in `WindowContext::on_resize`.
+    let _ = h.sender.send(Msg::Resize(ws));
+    let term_size = TermSize::new(safe_cols as usize, safe_rows as usize);
+    h.term.lock().resize(term_size);
 }
 
-/// Take a snapshot of the current terminal state. Phase 1 returns a
-/// fixture row matching the spike (red R, inverse I, wide CJK 한,
-/// ZWJ family emoji, ligature `fi != !=` with pink underline), plus
-/// `rows-1` empty rows. Cursor sits at the end of the fixture
-/// content. Phase 2 will source this from `Term::grid()`.
+/// Take a snapshot of the visible viewport. Lock duration is bounded
+/// by the time it takes to walk `rows × cols` cells and copy them
+/// into the snapshot's owned buffers.
 #[unsafe(no_mangle)]
 pub extern "C" fn nestty_term_snapshot(handle: *mut NesttyHandle) -> *mut NesttySnapshot {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return ptr::null_mut();
     };
 
-    let fixture_utf8: Vec<u8> = b"RI\xed\x95\x9c\xf0\x9f\x91\xa8\xe2\x80\x8d\xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x91\xa7fi != !=".to_vec();
-    let fixture_runs = vec![
-        NesttyRun {
-            start_col: 0,
-            end_col: 1,
-            utf8_offset: 0,
-            utf8_len: 1,
-            fg_rgba: 0xff5555ff,
-            bg_rgba: 0,
-            flags: 0,
-            underline_style: 0,
-            reserved: 0,
-            underline_color_rgba: 0,
-            hyperlink_id: 0,
-        },
-        NesttyRun {
-            start_col: 1,
-            end_col: 2,
-            utf8_offset: 1,
-            utf8_len: 1,
-            fg_rgba: 0xffffffff,
-            bg_rgba: 0,
-            flags: flags::INVERSE,
-            underline_style: 0,
-            reserved: 0,
-            underline_color_rgba: 0,
-            hyperlink_id: 0,
-        },
-        NesttyRun {
-            start_col: 2,
-            end_col: 4,
-            utf8_offset: 2,
-            utf8_len: 3,
-            fg_rgba: 0x55ffffff,
-            bg_rgba: 0,
-            flags: flags::WIDE_LEADING,
-            underline_style: 0,
-            reserved: 0,
-            underline_color_rgba: 0,
-            hyperlink_id: 0,
-        },
-        NesttyRun {
-            start_col: 4,
-            end_col: 6,
-            utf8_offset: 5,
-            utf8_len: 18,
-            fg_rgba: 0xffffffff,
-            bg_rgba: 0,
-            flags: flags::WIDE_LEADING,
-            underline_style: 0,
-            reserved: 0,
-            underline_color_rgba: 0,
-            hyperlink_id: 0,
-        },
-        NesttyRun {
-            start_col: 6,
-            end_col: 14,
-            utf8_offset: 23,
-            utf8_len: (fixture_utf8.len() - 23) as u32,
-            fg_rgba: 0xeeeeeeff,
-            bg_rgba: 0,
-            flags: 0,
-            underline_style: 1,
-            reserved: 0,
-            underline_color_rgba: 0xff55aaff,
-            hyperlink_id: 0,
-        },
-    ];
+    let term = h.term.lock();
+    let cols = term.columns() as u16;
+    let rows_count = term.screen_lines() as u16;
+    let grid = term.grid();
 
-    let mut rows = Vec::with_capacity(h.rows as usize);
-    rows.push(Row {
-        utf8: fixture_utf8,
-        runs: fixture_runs,
-    });
-    for _ in 1..h.rows {
-        rows.push(Row {
-            utf8: Vec::new(),
-            runs: Vec::new(),
-        });
+    let mut snapshot_rows = Vec::with_capacity(rows_count as usize);
+    for line_idx in 0..rows_count as i32 {
+        let line = Line(line_idx);
+        let row = walk_row(grid, line, cols);
+        snapshot_rows.push(row);
     }
 
-    Box::into_raw(Box::new(NesttySnapshot {
-        cols: h.cols,
-        rows,
-        cursor: NesttyCursor {
-            row: 0,
-            col: 14,
-            style: 1, // block
-            blink: 0,
-            _reserved: 0,
+    let cursor_point = term.grid().cursor.point;
+    let cursor = NesttyCursor {
+        row: cursor_point.line.0.max(0) as u16,
+        col: cursor_point.column.0 as u16,
+        style: if term.mode().contains(alacritty_terminal::term::TermMode::SHOW_CURSOR) {
+            1 // block; DECSCUSR style refinement lands with the renderer in Phase 3
+        } else {
+            0
         },
+        blink: 0,
+        _reserved: 0,
+    };
+
+    drop(term);
+
+    Box::into_raw(Box::new(NesttySnapshot {
+        cols,
+        rows: snapshot_rows,
+        cursor,
     }))
+}
+
+/// Walk a single display line into a `Row`. Groups consecutive cells
+/// with identical attributes into runs; appends each cell's char + any
+/// zero-width combining marks into the row's utf8 buffer.
+fn walk_row(
+    grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+    line: Line,
+    cols: u16,
+) -> Row {
+    let mut utf8: Vec<u8> = Vec::new();
+    let mut runs: Vec<NesttyRun> = Vec::new();
+    let mut col: u16 = 0;
+
+    while col < cols {
+        let point = Point::new(line, Column(col as usize));
+        let cell = &grid[point];
+
+        // Wide-char trailing cells (the "right half" of a CJK glyph
+        // emitted alongside the leading half) carry no glyph and
+        // shouldn't generate a run of their own — they're absorbed
+        // by the leading half's run.
+        if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+            col += 1;
+            continue;
+        }
+
+        let span_cols = if cell.flags.contains(CellFlags::WIDE_CHAR) { 2 } else { 1 };
+        let utf8_offset = utf8.len() as u32;
+
+        let mut buf = [0u8; 4];
+        utf8.extend_from_slice(cell.c.encode_utf8(&mut buf).as_bytes());
+        // Combining marks live in CellExtra.zerowidth — fold them
+        // into the same run's utf8 so CoreText shapes them with
+        // their base glyph.
+        for combine in cell.zerowidth().unwrap_or(&[]) {
+            utf8.extend_from_slice(combine.encode_utf8(&mut buf).as_bytes());
+        }
+
+        let utf8_len = utf8.len() as u32 - utf8_offset;
+
+        let mut run_flags = cell_flags_to_ffi(cell.flags);
+        if span_cols == 2 {
+            run_flags |= flags::WIDE_LEADING;
+        }
+
+        let (fg, bg) = (color_to_rgba(cell.fg), color_to_rgba(cell.bg));
+        let underline_color = cell.underline_color()
+            .map(|c| color_to_rgba_resolved(c))
+            .unwrap_or(0);
+        let underline_style = if cell.flags.intersects(
+            CellFlags::ALL_UNDERLINES,
+        ) {
+            // Phase 2 just exposes "1 = some underline"; richer
+            // undercurl/dotted decoding lands with the renderer.
+            1
+        } else {
+            0
+        };
+
+        runs.push(NesttyRun {
+            start_col: col,
+            end_col: col + span_cols as u16,
+            utf8_offset,
+            utf8_len,
+            fg_rgba: fg,
+            bg_rgba: bg,
+            flags: run_flags,
+            underline_style,
+            reserved: 0,
+            underline_color_rgba: underline_color,
+            hyperlink_id: cell.hyperlink().map_or(0, |_| 1),
+        });
+
+        col += span_cols as u16;
+    }
+
+    Row { utf8, runs }
+}
+
+fn cell_flags_to_ffi(f: CellFlags) -> u16 {
+    let mut out = 0u16;
+    if f.contains(CellFlags::BOLD) { out |= flags::BOLD; }
+    if f.contains(CellFlags::ITALIC) { out |= flags::ITALIC; }
+    if f.contains(CellFlags::INVERSE) { out |= flags::INVERSE; }
+    if f.contains(CellFlags::DIM) { out |= flags::DIM; }
+    if f.contains(CellFlags::STRIKEOUT) { out |= flags::STRIKE; }
+    if f.contains(CellFlags::HIDDEN) { /* nothing in our flag set; renderer can decide */ }
+    // ALL_UNDERLINES covers single/double/curly/dotted/dashed; we
+    // collapse to the UNDERLINE bit for Phase 2 (style enum at
+    // `NesttyRun::underline_style` carries the variant).
+    if f.intersects(CellFlags::ALL_UNDERLINES) { out |= flags::UNDERLINE; }
+    out
+}
+
+/// `Color::Named(Foreground|Background)` → sentinel 0 so the renderer
+/// can decide whether to materialize to theme bg or pass-through
+/// transparent (Zed pattern, Phase 3). `Color::Spec(rgb)` → direct
+/// pack. `Color::Indexed(_)` → 0 placeholder for Phase 2; the renderer
+/// will wire an ANSI palette in Phase 3.
+fn color_to_rgba(color: AnsiColor) -> u32 {
+    match color {
+        AnsiColor::Named(NamedColor::Foreground) | AnsiColor::Named(NamedColor::Background) => 0,
+        AnsiColor::Spec(rgb) => ((rgb.r as u32) << 24) | ((rgb.g as u32) << 16) | ((rgb.b as u32) << 8) | 0xff,
+        _ => 0,
+    }
+}
+
+/// `cell.underline_color()` returns the SPEC color directly when set
+/// (not a Color enum). Used when underline color is explicitly
+/// overridden (e.g. via `\\e[58;2;R;G;Bm`).
+fn color_to_rgba_resolved(color: AnsiColor) -> u32 {
+    match color {
+        AnsiColor::Spec(rgb) => ((rgb.r as u32) << 24) | ((rgb.g as u32) << 16) | ((rgb.b as u32) << 8) | 0xff,
+        _ => 0,
+    }
 }
 
 /// Free a snapshot. Safe to pass NULL. Calling twice is UB.
@@ -261,9 +411,9 @@ pub extern "C" fn nestty_snapshot_cols(snap: *const NesttySnapshot) -> u16 {
     s.cols
 }
 
-/// Hand the caller a borrowed pointer to the row's run array.
-/// Pointer valid until `nestty_snapshot_destroy`. Returns 0 if row is
-/// out of range; `*out_runs` is set to NULL in that case.
+/// Borrowed pointer to the row's run array. Valid until
+/// `nestty_snapshot_destroy`. Returns 0 if row is out of range;
+/// `*out_runs` set to NULL in that case.
 ///
 /// # Safety
 ///
@@ -289,9 +439,7 @@ pub unsafe extern "C" fn nestty_snapshot_row_runs(
     row_data.runs.len()
 }
 
-/// Borrowed pointer to the row's utf8 bytes + length. Same lifetime
-/// contract as `nestty_snapshot_row_runs`. Returns NULL with
-/// `*out_len = 0` on out-of-range row.
+/// Borrowed pointer to the row's utf8 bytes + length. Same lifetime.
 ///
 /// # Safety
 ///
@@ -321,8 +469,7 @@ pub unsafe extern "C" fn nestty_snapshot_row_utf8(
     }
 }
 
-/// Fill `*out` with the snapshot's cursor state. No-op if snap or out
-/// is NULL.
+/// Fill `*out` with the snapshot's cursor state.
 ///
 /// # Safety
 ///
@@ -336,75 +483,8 @@ pub unsafe extern "C" fn nestty_snapshot_cursor(snap: *const NesttySnapshot, out
     unsafe { *out = s.cursor };
 }
 
-/// Static version + phase tag so a Swift host can verify which
-/// scaffold level it's linked against.
 #[unsafe(no_mangle)]
 pub extern "C" fn nestty_term_version() -> *const c_char {
-    static VERSION: &CStr = c"nestty-term 0.1.0 (Phase 1 scaffold, fixture data only)";
+    static VERSION: &CStr = c"nestty-term 0.2.0 (Phase 2 — PTY + grid)";
     VERSION.as_ptr()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn handle_create_destroy_round_trip() {
-        unsafe {
-            let h = nestty_term_create(80, 24, std::ptr::null(), std::ptr::null());
-            assert!(!h.is_null());
-            nestty_term_destroy(h);
-        }
-    }
-
-    #[test]
-    fn snapshot_exposes_fixture_row() {
-        unsafe {
-            let h = nestty_term_create(80, 24, std::ptr::null(), std::ptr::null());
-            let snap = nestty_term_snapshot(h);
-            assert!(!snap.is_null());
-
-            assert_eq!(nestty_snapshot_rows(snap), 24);
-            assert_eq!(nestty_snapshot_cols(snap), 80);
-
-            let mut runs_ptr: *const NesttyRun = std::ptr::null();
-            let n = nestty_snapshot_row_runs(snap, 0, &mut runs_ptr);
-            assert_eq!(n, 5);
-            let runs = std::slice::from_raw_parts(runs_ptr, n);
-            assert_eq!(runs[0].start_col, 0);
-            assert_eq!(runs[1].flags & flags::INVERSE, flags::INVERSE);
-            assert_eq!(runs[2].end_col, 4); // wide CJK spans 2 cols
-            assert_eq!(runs[4].underline_style, 1);
-
-            let mut utf8_len: usize = 0;
-            let utf8_ptr = nestty_snapshot_row_utf8(snap, 0, &mut utf8_len);
-            assert!(!utf8_ptr.is_null());
-            assert!(utf8_len > 0);
-            let bytes = std::slice::from_raw_parts(utf8_ptr, utf8_len);
-            assert_eq!(bytes[0], b'R');
-            assert_eq!(bytes[1], b'I');
-
-            let mut cur = NesttyCursor {
-                row: 99,
-                col: 99,
-                style: 99,
-                blink: 99,
-                _reserved: 0,
-            };
-            nestty_snapshot_cursor(snap, &mut cur);
-            assert_eq!(cur.col, 14);
-            assert_eq!(cur.style, 1);
-
-            nestty_snapshot_destroy(snap);
-            nestty_term_destroy(h);
-        }
-    }
-
-    #[test]
-    fn null_destroy_no_op() {
-        unsafe {
-            nestty_term_destroy(std::ptr::null_mut());
-            nestty_snapshot_destroy(std::ptr::null_mut());
-        }
-    }
 }
