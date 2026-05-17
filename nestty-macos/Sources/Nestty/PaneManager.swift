@@ -111,9 +111,9 @@ final class PaneManager {
 
         let panel: any NesttyPanel = switch initialPanel {
         case .terminal:
-            TerminalViewController(config: config, theme: theme)
+            Self.makeTerminalPanel(config: config, theme: theme)
         case let .terminalSeed(cwd, initialInput):
-            TerminalViewController(config: config, theme: theme, cwd: cwd, initialInput: initialInput)
+            Self.makeTerminalPanel(config: config, theme: theme, cwd: cwd, initialInput: initialInput)
         case let .webview(url):
             WebViewController(url: url)
         case let .pluginPanel(p):
@@ -140,7 +140,7 @@ final class PaneManager {
     // MARK: - Public API
 
     func splitActive(orientation: SplitOrientation) {
-        let newTermVC = TerminalViewController(config: config, theme: theme)
+        let newTermVC = Self.makeTerminalPanel(config: config, theme: theme)
         assignEventBus(to: newTermVC)
         wirePanel(newTermVC)
 
@@ -151,6 +151,24 @@ final class PaneManager {
         setActive(newTermVC)
         newTermVC.startIfNeeded()
         newTermVC.view.window?.makeFirstResponder(newTermVC.view)
+    }
+
+    /// Factory: pick the terminal renderer based on `[renderer] backend`.
+    /// SwiftTerm is the production default; alacritty is the in-progress
+    /// replacement and only renders a scaffold until Phase 3.2 wires
+    /// its CoreText draw loop.
+    static func makeTerminalPanel(
+        config: NesttyConfig,
+        theme: NesttyTheme,
+        cwd: String? = nil,
+        initialInput: String? = nil,
+    ) -> any NesttyPanel {
+        switch config.rendererBackend {
+        case .swiftterm:
+            TerminalViewController(config: config, theme: theme, cwd: cwd, initialInput: initialInput)
+        case .alacritty:
+            AlacrittyTerminalViewController(config: config, theme: theme, cwd: cwd, initialInput: initialInput)
+        }
     }
 
     func splitActiveWithWebView(url: URL? = nil, orientation: SplitOrientation = .horizontal) {

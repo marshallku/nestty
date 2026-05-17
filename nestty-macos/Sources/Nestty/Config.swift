@@ -43,6 +43,23 @@ struct StatusBarConfig {
     static let defaults = StatusBarConfig(enabled: true, position: "bottom", height: 28)
 }
 
+/// Selects which terminal-emulation core renders a pane.
+/// `swiftterm` is the historical default; `alacritty` is the in-progress
+/// replacement (see docs/macos-renderer-migration-plan.md). Read once per
+/// pane at construction time — flipping the config requires a restart
+/// (or a new tab) for the change to apply.
+enum RendererBackend: String {
+    case swiftterm
+    case alacritty
+
+    static func parse(_ raw: String?) -> RendererBackend {
+        switch raw?.lowercased() {
+        case "alacritty": .alacritty
+        default: .swiftterm
+        }
+    }
+}
+
 struct NesttyConfig {
     let shell: String
     let fontFamily: String
@@ -54,6 +71,11 @@ struct NesttyConfig {
     /// Distinct from `backgroundTint`, which darkens the image via an overlay.
     let backgroundOpacity: Double
     let osc52: OSC52Policy
+    /// `[renderer] backend = "swiftterm" | "alacritty"`. Defaults to
+    /// swiftterm until the alacritty renderer reaches Linux-parity quality
+    /// and Phase 10 flips the default. Per-pane: each new tab/split reads
+    /// the live config value at construction time.
+    let rendererBackend: RendererBackend
     /// Tier 1.4 — `[tabs] position` (top/bottom). left/right deferred.
     let tabsPosition: TabsPosition
     /// Tier 4.2 — `[statusbar]` config (enabled/position/height). Modules
@@ -113,6 +135,7 @@ struct NesttyConfig {
             backgroundTint: clamp01(raw.background?.tint ?? defaults.backgroundTint),
             backgroundOpacity: clamp01(raw.background?.opacity ?? defaults.backgroundOpacity),
             osc52: raw.security?.osc52 ?? defaults.osc52,
+            rendererBackend: RendererBackend.parse(raw.renderer?.backend),
             tabsPosition: raw.tabs?.position.map(TabsPosition.parse) ?? defaults.tabsPosition,
             statusBar: StatusBarConfig(
                 enabled: raw.statusbar?.enabled ?? defaults.statusBar.enabled,
@@ -142,6 +165,7 @@ struct NesttyConfig {
             backgroundTint: 0.6,
             backgroundOpacity: 1.0,
             osc52: .deny,
+            rendererBackend: .swiftterm,
             tabsPosition: .top,
             statusBar: .defaults,
             keybindings: [:],
@@ -245,8 +269,13 @@ private struct RawConfig: Decodable {
     var theme: ThemeSection?
     var background: BackgroundSection?
     var security: SecuritySection?
+    var renderer: RendererSection?
     var tabs: TabsSection?
     var statusbar: StatusBarSection?
+}
+
+private struct RendererSection: Decodable {
+    var backend: String?
 }
 
 private struct StatusBarSection: Decodable {
