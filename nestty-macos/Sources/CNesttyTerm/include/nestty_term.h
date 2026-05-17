@@ -22,12 +22,16 @@ typedef struct {
     uint16_t end_col;          // exclusive; wide CJK / ZWJ emoji span both cells in one run
     uint32_t utf8_offset;      // byte offset into the row's utf8 buffer
     uint32_t utf8_len;
-    uint32_t fg_rgba;          // 0xRRGGBBAA
-    uint32_t bg_rgba;          // 0 = default-bg sentinel; renderer materializes
+    // Tagged color: MSB is the discriminator.
+    //   0x00_00_00_00            default (renderer materializes theme fg/bg)
+    //   0x01_00_00_NN            indexed N (0..15 palette, 16..231 cube, 232..255 grayscale)
+    //   0xFF_RR_GG_BB            direct RGB (always opaque)
+    uint32_t fg_rgba;
+    uint32_t bg_rgba;          // same encoding; 0 = default-bg sentinel
     uint16_t flags;
     uint8_t  underline_style;  // 0=none 1=single 2=double 3=curly 4=dotted 5=dashed
     uint8_t  reserved;
-    uint32_t underline_color_rgba; // 0 = use fg
+    uint32_t underline_color_rgba; // same encoding as fg_rgba; 0 = use fg
     uint32_t hyperlink_id;     // 0 = none; opaque key into separate hyperlink table (Phase 4+)
 } NesttyRun;
 

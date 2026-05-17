@@ -201,26 +201,28 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         return out
     }
 
-    /// Decode the fg/bg encoding from `nestty-term::color_to_rgba`
-    /// (alpha=0 + low-byte = indexed palette, alpha>0 = direct RGBA).
-    /// `defaultColor` is the theme color used when the run is the
-    /// sentinel 0.
+    /// Decode the fg/bg encoding from `nestty-term::color_to_rgba`.
+    /// High byte is a tag: 0x00=default, 0x01=indexed (low byte holds
+    /// the index), 0xFF=direct RGB in the low 24 bits. Tagged because
+    /// the old "alpha byte = 0 means indexed" trick collided with RGB
+    /// colors that have R=0 (skyblue, pure green) — those silently
+    /// fell into the indexed path and rendered as grayscale.
     private func resolveColor(_ packed: UInt32, defaultColor: CGColor) -> CGColor {
-        if packed == 0 { return defaultColor }
-        let alpha = (packed >> 24) & 0xFF
-        if alpha == 0 {
-            // Indexed palette entry; low byte is the index.
+        let tag = (packed >> 24) & 0xFF
+        switch tag {
+        case 0x00:
+            return defaultColor
+        case 0x01:
             let idx = Int(packed & 0xFF)
-            if idx < paletteCache.count {
-                return paletteCache[idx]
-            }
+            return idx < paletteCache.count ? paletteCache[idx] : defaultColor
+        case 0xFF:
+            let r = CGFloat((packed >> 16) & 0xFF) / 255.0
+            let g = CGFloat((packed >> 8) & 0xFF) / 255.0
+            let b = CGFloat(packed & 0xFF) / 255.0
+            return CGColor(red: r, green: g, blue: b, alpha: 1.0)
+        default:
             return defaultColor
         }
-        let r = CGFloat((packed >> 24) & 0xFF) / 255.0
-        let g = CGFloat((packed >> 16) & 0xFF) / 255.0
-        let b = CGFloat((packed >> 8) & 0xFF) / 255.0
-        let a = CGFloat(packed & 0xFF) / 255.0
-        return CGColor(red: r, green: g, blue: b, alpha: a)
     }
 
     @available(*, unavailable)

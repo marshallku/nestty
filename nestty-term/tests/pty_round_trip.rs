@@ -19,10 +19,14 @@ use nestty_term::*;
 /// Drive the PTY until `predicate` returns true OR the deadline
 /// expires. Snapshots in a tight-ish loop (10ms) so the test stays
 /// fast when output arrives quickly but doesn't busy-spin.
-fn wait_for<F: Fn(&str) -> bool>(handle: *mut NesttyHandle, predicate: F, deadline_ms: u64) -> Option<String> {
+fn wait_for<F: Fn(&str) -> bool>(
+    handle: *mut NesttyHandle,
+    predicate: F,
+    deadline_ms: u64,
+) -> Option<String> {
     let deadline = Instant::now() + Duration::from_millis(deadline_ms);
     loop {
-        let snap = nestty_term_snapshot(handle);
+        let snap = unsafe { nestty_term_snapshot(handle) };
         if snap.is_null() {
             return None;
         }
@@ -76,20 +80,20 @@ fn resize_round_trip() {
     assert!(!handle.is_null());
 
     // Initial geometry visible in snapshot.
-    let snap = nestty_term_snapshot(handle);
-    assert_eq!(nestty_snapshot_cols(snap), 80);
-    assert_eq!(nestty_snapshot_rows(snap), 24);
+    let snap = unsafe { nestty_term_snapshot(handle) };
+    assert_eq!(unsafe { nestty_snapshot_cols(snap) }, 80);
+    assert_eq!(unsafe { nestty_snapshot_rows(snap) }, 24);
     unsafe { nestty_snapshot_destroy(snap) };
 
-    nestty_term_resize(handle, 100, 40);
+    unsafe { nestty_term_resize(handle, 100, 40) };
 
     // The reader thread processes the Resize message asynchronously;
     // poll briefly for the snapshot to reflect the new dims.
     let deadline = Instant::now() + Duration::from_millis(1_000);
     let (cols, rows) = loop {
-        let snap = nestty_term_snapshot(handle);
-        let cols = nestty_snapshot_cols(snap);
-        let rows = nestty_snapshot_rows(snap);
+        let snap = unsafe { nestty_term_snapshot(handle) };
+        let cols = unsafe { nestty_snapshot_cols(snap) };
+        let rows = unsafe { nestty_snapshot_rows(snap) };
         unsafe { nestty_snapshot_destroy(snap) };
         if (cols, rows) == (100, 40) || Instant::now() >= deadline {
             break (cols, rows);
@@ -98,7 +102,11 @@ fn resize_round_trip() {
     };
 
     unsafe { nestty_term_destroy(handle) };
-    assert_eq!((cols, rows), (100, 40), "resize never reflected in snapshot");
+    assert_eq!(
+        (cols, rows),
+        (100, 40),
+        "resize never reflected in snapshot"
+    );
 }
 
 #[test]

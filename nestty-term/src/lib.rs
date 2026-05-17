@@ -131,10 +131,10 @@ pub unsafe extern "C" fn nestty_term_create(
             tty_opts.shell = Some(Shell::new(s.to_owned(), Vec::new()));
         }
     }
-    if !cwd.is_null() {
-        if let Ok(s) = unsafe { CStr::from_ptr(cwd) }.to_str() {
-            tty_opts.working_directory = Some(PathBuf::from(s));
-        }
+    if !cwd.is_null()
+        && let Ok(s) = unsafe { CStr::from_ptr(cwd) }.to_str()
+    {
+        tty_opts.working_directory = Some(PathBuf::from(s));
     }
 
     let window_size = WindowSize {
@@ -198,8 +198,14 @@ pub unsafe extern "C" fn nestty_term_destroy(handle: *mut NesttyHandle) {
 ///
 /// `bytes` must point to `len` readable bytes (or be NULL when len=0).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn nestty_term_input(handle: *mut NesttyHandle, bytes: *const u8, len: usize) {
-    let Some(h) = (unsafe { handle.as_ref() }) else { return };
+pub unsafe extern "C" fn nestty_term_input(
+    handle: *mut NesttyHandle,
+    bytes: *const u8,
+    len: usize,
+) {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return;
+    };
     if len == 0 || bytes.is_null() {
         return;
     }
@@ -210,9 +216,16 @@ pub unsafe extern "C" fn nestty_term_input(handle: *mut NesttyHandle, bytes: *co
 /// Resize the PTY + Term grid. `cell_width`/`cell_height` left at 1
 /// since this FFI is headless; real pixel sizes land when a renderer
 /// attaches.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a valid pointer returned by
+/// `nestty_term_create` and not yet destroyed.
 #[unsafe(no_mangle)]
-pub extern "C" fn nestty_term_resize(handle: *mut NesttyHandle, cols: u16, rows: u16) {
-    let Some(h) = (unsafe { handle.as_ref() }) else { return };
+pub unsafe extern "C" fn nestty_term_resize(handle: *mut NesttyHandle, cols: u16, rows: u16) {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return;
+    };
     let safe_cols = cols.max(1);
     let safe_rows = rows.max(1);
 
@@ -234,8 +247,13 @@ pub extern "C" fn nestty_term_resize(handle: *mut NesttyHandle, cols: u16, rows:
 /// Take a snapshot of the visible viewport. Lock duration is bounded
 /// by the time it takes to walk `rows × cols` cells and copy them
 /// into the snapshot's owned buffers.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a valid pointer returned by
+/// `nestty_term_create` and not yet destroyed.
 #[unsafe(no_mangle)]
-pub extern "C" fn nestty_term_snapshot(handle: *mut NesttyHandle) -> *mut NesttySnapshot {
+pub unsafe extern "C" fn nestty_term_snapshot(handle: *mut NesttyHandle) -> *mut NesttySnapshot {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return ptr::null_mut();
     };
@@ -313,7 +331,11 @@ fn walk_row(
             continue;
         }
 
-        let span_cols = if cell.flags.contains(CellFlags::WIDE_CHAR) { 2 } else { 1 };
+        let span_cols = if cell.flags.contains(CellFlags::WIDE_CHAR) {
+            2
+        } else {
+            1
+        };
         let utf8_offset = utf8.len() as u32;
 
         let mut buf = [0u8; 4];
@@ -333,12 +355,12 @@ fn walk_row(
         }
 
         let (fg, bg) = (color_to_rgba(cell.fg), color_to_rgba(cell.bg));
-        let underline_color = cell.underline_color()
-            .map(|c| color_to_rgba_resolved(c))
-            .unwrap_or(0);
-        let underline_style = if cell.flags.intersects(
-            CellFlags::ALL_UNDERLINES,
-        ) {
+        // `cell.underline_color()` can return any AnsiColor variant
+        // (Spec from `\e[58;2;…m`, Indexed from `\e[58;5;Nm`, or a
+        // named palette color), so route it through the same encoder
+        // as fg/bg instead of dropping non-Spec values.
+        let underline_color = cell.underline_color().map(color_to_rgba).unwrap_or(0);
+        let underline_style = if cell.flags.intersects(CellFlags::ALL_UNDERLINES) {
             // Phase 2 just exposes "1 = some underline"; richer
             // undercurl/dotted decoding lands with the renderer.
             1
@@ -368,46 +390,70 @@ fn walk_row(
 
 fn cell_flags_to_ffi(f: CellFlags) -> u16 {
     let mut out = 0u16;
-    if f.contains(CellFlags::BOLD) { out |= flags::BOLD; }
-    if f.contains(CellFlags::ITALIC) { out |= flags::ITALIC; }
-    if f.contains(CellFlags::INVERSE) { out |= flags::INVERSE; }
-    if f.contains(CellFlags::DIM) { out |= flags::DIM; }
-    if f.contains(CellFlags::STRIKEOUT) { out |= flags::STRIKE; }
+    if f.contains(CellFlags::BOLD) {
+        out |= flags::BOLD;
+    }
+    if f.contains(CellFlags::ITALIC) {
+        out |= flags::ITALIC;
+    }
+    if f.contains(CellFlags::INVERSE) {
+        out |= flags::INVERSE;
+    }
+    if f.contains(CellFlags::DIM) {
+        out |= flags::DIM;
+    }
+    if f.contains(CellFlags::STRIKEOUT) {
+        out |= flags::STRIKE;
+    }
     if f.contains(CellFlags::HIDDEN) { /* nothing in our flag set; renderer can decide */ }
     // ALL_UNDERLINES covers single/double/curly/dotted/dashed; we
     // collapse to the UNDERLINE bit for Phase 2 (style enum at
     // `NesttyRun::underline_style` carries the variant).
-    if f.intersects(CellFlags::ALL_UNDERLINES) { out |= flags::UNDERLINE; }
+    if f.intersects(CellFlags::ALL_UNDERLINES) {
+        out |= flags::UNDERLINE;
+    }
     out
 }
 
-/// Encoding scheme for the `fg_rgba` / `bg_rgba` u32 fields, chosen
-/// so the Swift renderer can distinguish three color kinds without
-/// growing the ABI:
+/// Encoding scheme for the `fg_rgba` / `bg_rgba` u32 fields. The high
+/// byte is a tag that disambiguates three color kinds without growing
+/// the ABI:
 ///
-/// - `0x00000000` — default (renderer materializes to theme fg/bg).
-/// - `0x000000NN` (alpha byte = 0, low byte = N in 0..255) — indexed
-///   palette color. Swift resolves 0-15 from `theme.palette`, 16-231
-///   from the 6×6×6 xterm color cube, 232-255 from the 24-step
-///   grayscale ramp.
-/// - `0xRRGGBBAA` with alpha > 0 — direct RGB, decoded as-is.
+/// - `0x00_00_00_00` — default (renderer materializes to theme fg/bg).
+/// - `0x01_00_00_NN` — indexed palette color (N in 0..255). Swift
+///   resolves 0-15 from `theme.palette`, 16-231 from the 6×6×6 xterm
+///   color cube, 232-255 from the 24-step grayscale ramp.
+/// - `0xFF_RR_GG_BB` — direct RGB. Always opaque (alpha forced to 1
+///   on decode) because terminal cells don't have a meaningful alpha.
 ///
-/// The alpha=0 + RGB-zero collision is intentional: a true "black at
-/// alpha 0" is meaningless for terminal cells (it's just "default").
+/// Tag-based discrimination is required because the older "alpha=0
+/// means indexed" trick ambiguated against RGB colors whose R channel
+/// is 0 (`\\e[38;2;0;200;255m` and similar), which silently routed
+/// them through the indexed path. Other tag values are reserved.
+const TAG_INDEXED: u32 = 0x01_00_00_00;
+const TAG_DIRECT: u32 = 0xFF_00_00_00;
+
 fn color_to_rgba(color: AnsiColor) -> u32 {
     match color {
         AnsiColor::Named(NamedColor::Foreground) | AnsiColor::Named(NamedColor::Background) => 0,
-        AnsiColor::Named(named) => named_to_indexed(named),
-        AnsiColor::Indexed(idx) => idx as u32,
-        AnsiColor::Spec(rgb) => ((rgb.r as u32) << 24) | ((rgb.g as u32) << 16) | ((rgb.b as u32) << 8) | 0xff,
+        AnsiColor::Named(named) => match named_to_indexed(named) {
+            Some(idx) => TAG_INDEXED | idx as u32,
+            None => 0,
+        },
+        AnsiColor::Indexed(idx) => TAG_INDEXED | idx as u32,
+        AnsiColor::Spec(rgb) => {
+            TAG_DIRECT | ((rgb.r as u32) << 16) | ((rgb.g as u32) << 8) | (rgb.b as u32)
+        }
     }
 }
 
 /// Map `NamedColor` variants the SGR parser hands us into ANSI
 /// palette indices the Swift side already knows how to resolve. Keeps
 /// the bright/dim variants honest (bright red is index 9, not 1) so
-/// `printf '\033[91mhi'` actually renders bright.
-fn named_to_indexed(named: NamedColor) -> u32 {
+/// `printf '\033[91mhi'` actually renders bright. Returns `None` for
+/// non-palette named colors (DimFg, Cursor, …) so the caller can fall
+/// back to the default sentinel.
+fn named_to_indexed(named: NamedColor) -> Option<u8> {
     let idx: u8 = match named {
         NamedColor::Black => 0,
         NamedColor::Red => 1,
@@ -425,24 +471,17 @@ fn named_to_indexed(named: NamedColor) -> u32 {
         NamedColor::BrightMagenta => 13,
         NamedColor::BrightCyan => 14,
         NamedColor::BrightWhite => 15,
-        // DimFg / Cursor / etc. aren't part of the 16-color
-        // palette; fall back to default and let the renderer pick.
-        _ => return 0,
+        _ => return None,
     };
-    idx as u32
+    Some(idx)
 }
 
-/// `cell.underline_color()` returns the SPEC color directly when set
-/// (not a Color enum). Used when underline color is explicitly
-/// overridden (e.g. via `\\e[58;2;R;G;Bm`).
-fn color_to_rgba_resolved(color: AnsiColor) -> u32 {
-    match color {
-        AnsiColor::Spec(rgb) => ((rgb.r as u32) << 24) | ((rgb.g as u32) << 16) | ((rgb.b as u32) << 8) | 0xff,
-        _ => 0,
-    }
-}
-
-/// Free a snapshot. Safe to pass NULL. Calling twice is UB.
+/// Free a snapshot.
+///
+/// # Safety
+///
+/// `snap` must be NULL or a valid pointer returned by
+/// `nestty_term_snapshot` and not yet destroyed. Calling twice is UB.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nestty_snapshot_destroy(snap: *mut NesttySnapshot) {
     if snap.is_null() {
@@ -451,15 +490,27 @@ pub unsafe extern "C" fn nestty_snapshot_destroy(snap: *mut NesttySnapshot) {
     let _ = unsafe { Box::from_raw(snap) };
 }
 
+/// # Safety
+///
+/// `snap` must be NULL or a valid pointer returned by
+/// `nestty_term_snapshot` and not yet destroyed.
 #[unsafe(no_mangle)]
-pub extern "C" fn nestty_snapshot_rows(snap: *const NesttySnapshot) -> u16 {
-    let Some(s) = (unsafe { snap.as_ref() }) else { return 0 };
+pub unsafe extern "C" fn nestty_snapshot_rows(snap: *const NesttySnapshot) -> u16 {
+    let Some(s) = (unsafe { snap.as_ref() }) else {
+        return 0;
+    };
     s.rows.len() as u16
 }
 
+/// # Safety
+///
+/// `snap` must be NULL or a valid pointer returned by
+/// `nestty_term_snapshot` and not yet destroyed.
 #[unsafe(no_mangle)]
-pub extern "C" fn nestty_snapshot_cols(snap: *const NesttySnapshot) -> u16 {
-    let Some(s) = (unsafe { snap.as_ref() }) else { return 0 };
+pub unsafe extern "C" fn nestty_snapshot_cols(snap: *const NesttySnapshot) -> u16 {
+    let Some(s) = (unsafe { snap.as_ref() }) else {
+        return 0;
+    };
     s.cols
 }
 
@@ -527,11 +578,16 @@ pub unsafe extern "C" fn nestty_snapshot_row_utf8(
 ///
 /// `out` must point to writable storage for one `NesttyCursor`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn nestty_snapshot_cursor(snap: *const NesttySnapshot, out: *mut NesttyCursor) {
+pub unsafe extern "C" fn nestty_snapshot_cursor(
+    snap: *const NesttySnapshot,
+    out: *mut NesttyCursor,
+) {
     if out.is_null() {
         return;
     }
-    let Some(s) = (unsafe { snap.as_ref() }) else { return };
+    let Some(s) = (unsafe { snap.as_ref() }) else {
+        return;
+    };
     unsafe { *out = s.cursor };
 }
 
@@ -539,4 +595,103 @@ pub unsafe extern "C" fn nestty_snapshot_cursor(snap: *const NesttySnapshot, out
 pub extern "C" fn nestty_term_version() -> *const c_char {
     static VERSION: &CStr = c"nestty-term 0.2.0 (Phase 2 — PTY + grid)";
     VERSION.as_ptr()
+}
+
+#[cfg(test)]
+mod color_encoding_tests {
+    use super::*;
+    use alacritty_terminal::vte::ansi::Rgb;
+
+    #[test]
+    fn default_named_colors_use_sentinel_zero() {
+        assert_eq!(color_to_rgba(AnsiColor::Named(NamedColor::Foreground)), 0);
+        assert_eq!(color_to_rgba(AnsiColor::Named(NamedColor::Background)), 0);
+    }
+
+    #[test]
+    fn named_palette_colors_carry_indexed_tag() {
+        assert_eq!(
+            color_to_rgba(AnsiColor::Named(NamedColor::Red)),
+            TAG_INDEXED | 1
+        );
+        assert_eq!(
+            color_to_rgba(AnsiColor::Named(NamedColor::Yellow)),
+            TAG_INDEXED | 3
+        );
+        assert_eq!(
+            color_to_rgba(AnsiColor::Named(NamedColor::BrightRed)),
+            TAG_INDEXED | 9
+        );
+        assert_eq!(
+            color_to_rgba(AnsiColor::Named(NamedColor::BrightWhite)),
+            TAG_INDEXED | 15
+        );
+    }
+
+    #[test]
+    fn indexed_256_carries_indexed_tag() {
+        assert_eq!(color_to_rgba(AnsiColor::Indexed(0)), TAG_INDEXED);
+        assert_eq!(color_to_rgba(AnsiColor::Indexed(245)), TAG_INDEXED | 245);
+        assert_eq!(color_to_rgba(AnsiColor::Indexed(255)), TAG_INDEXED | 255);
+    }
+
+    /// Regression test for the original bug: RGB colors with R=0 used
+    /// to be mis-decoded as indexed (the high byte was 0, which the old
+    /// Swift decoder read as "indexed palette"). Now they carry the
+    /// 0xFF direct tag so the decoder can disambiguate.
+    #[test]
+    fn rgb_with_zero_red_does_not_collide_with_indexed() {
+        let skyblue = color_to_rgba(AnsiColor::Spec(Rgb {
+            r: 0,
+            g: 200,
+            b: 255,
+        }));
+        assert_eq!(skyblue >> 24, 0xFF, "direct-color tag must be set");
+        assert_eq!((skyblue >> 16) & 0xFF, 0);
+        assert_eq!((skyblue >> 8) & 0xFF, 200);
+        assert_eq!(skyblue & 0xFF, 255);
+
+        let pure_green = color_to_rgba(AnsiColor::Spec(Rgb { r: 0, g: 255, b: 0 }));
+        assert_eq!(pure_green >> 24, 0xFF);
+        assert_eq!(pure_green, TAG_DIRECT | (255 << 8));
+    }
+
+    #[test]
+    fn rgb_round_trip_preserves_channels() {
+        let red = color_to_rgba(AnsiColor::Spec(Rgb { r: 255, g: 0, b: 0 }));
+        assert_eq!(red, TAG_DIRECT | (255 << 16));
+
+        let black = color_to_rgba(AnsiColor::Spec(Rgb { r: 0, g: 0, b: 0 }));
+        // Pure-black RGB stays distinguishable from "default" via the tag.
+        assert_eq!(black, TAG_DIRECT);
+        assert_ne!(black, 0);
+    }
+
+    #[test]
+    fn named_unmappable_falls_back_to_default() {
+        // DimFg, Cursor, etc. aren't in the 16-color palette; the
+        // encoder collapses them to the default sentinel so the
+        // renderer picks the theme foreground.
+        assert_eq!(
+            color_to_rgba(AnsiColor::Named(NamedColor::DimForeground)),
+            0
+        );
+    }
+
+    /// Underline color goes through the same encoder as fg/bg now, so
+    /// `\e[58;5;Nm` (indexed) and `\e[58;2;…m` (direct) both round-trip
+    /// through the renderer instead of the indexed branch silently
+    /// becoming "use fg".
+    #[test]
+    fn underline_color_uses_same_encoding_as_fg() {
+        assert_eq!(
+            color_to_rgba(AnsiColor::Spec(Rgb { r: 10, g: 20, b: 30 })),
+            TAG_DIRECT | (10 << 16) | (20 << 8) | 30,
+        );
+        assert_eq!(color_to_rgba(AnsiColor::Indexed(5)), TAG_INDEXED | 5);
+        assert_eq!(
+            color_to_rgba(AnsiColor::Named(NamedColor::Red)),
+            TAG_INDEXED | 1,
+        );
+    }
 }
