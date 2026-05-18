@@ -2,7 +2,10 @@ use clap::{Parser, Subcommand};
 use serde_json::json;
 
 use crate::plugin_cmds::bookmark::BookmarkCommand;
+use crate::plugin_cmds::calendar::CalendarCommand;
 use crate::plugin_cmds::git::GitCommand;
+use crate::plugin_cmds::jira::JiraCommand;
+use crate::plugin_cmds::slack::SlackCommand;
 use crate::plugin_cmds::todo::TodoCommand;
 
 #[derive(Parser)]
@@ -87,6 +90,20 @@ pub enum Command {
     /// Bookmark shortcuts (`bookmark.*` URL → KB capture; urlhash8 prefix)
     #[command(subcommand)]
     Bookmark(BookmarkCommand),
+
+    /// Jira shortcuts (`jira.*` actions — `mine` / `ticket` / `transition`
+    /// / `comment` / `auth-status`)
+    #[command(subcommand)]
+    Jira(JiraCommand),
+
+    /// Slack shortcuts (`slack.*` actions — `send` / `get` / `auth-status`)
+    #[command(subcommand)]
+    Slack(SlackCommand),
+
+    /// Calendar shortcuts (`calendar.*` actions — `today` / `next` /
+    /// `event` / `auth-status`)
+    #[command(subcommand)]
+    Calendar(CalendarCommand),
 
     /// Status bar management
     #[command(subcommand)]
@@ -542,6 +559,15 @@ impl Cli {
             Command::Bookmark(_) => {
                 unreachable!("bookmark commands are dispatched via plugin_cmds::bookmark")
             }
+            Command::Jira(_) => {
+                unreachable!("jira commands are dispatched via plugin_cmds::jira")
+            }
+            Command::Slack(_) => {
+                unreachable!("slack commands are dispatched via plugin_cmds::slack")
+            }
+            Command::Calendar(_) => {
+                unreachable!("calendar commands are dispatched via plugin_cmds::calendar")
+            }
             Command::Call { method, .. } => method.clone(),
         }
     }
@@ -654,6 +680,15 @@ impl Cli {
             }
             Command::Bookmark(_) => {
                 unreachable!("bookmark commands are dispatched via plugin_cmds::bookmark")
+            }
+            Command::Jira(_) => {
+                unreachable!("jira commands are dispatched via plugin_cmds::jira")
+            }
+            Command::Slack(_) => {
+                unreachable!("slack commands are dispatched via plugin_cmds::slack")
+            }
+            Command::Calendar(_) => {
+                unreachable!("calendar commands are dispatched via plugin_cmds::calendar")
             }
             Command::Call { params, .. } => {
                 serde_json::from_str(params).unwrap_or_else(|_| json!({}))

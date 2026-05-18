@@ -564,3 +564,24 @@ Both are documented v2 work. The fallback behavior is "next launch has a smaller
 **Configurability:** `NESTTY_GIT_POLL_MS` overrides the default 2000 ms; values below 250 ms are clamped to protect against accidental tight loops. No "interval = 0 = disabled" mode — to disable, remove the workspace entries or `kill -9` the plugin.
 
 **See:** `plugins/git/src/watcher.rs` (snapshot + diff + spawn + 9 unit tests including a real-`git` E2E), `plugins/git/src/main.rs` (`watcher::spawn(...)` after Config load), `plugins/git/plugin.toml` (version bump to 0.2.0, `activation = "onStartup"`, description mentions emitted events).
+
+
+## 34. nestctl jira / slack / calendar subcommands (Phase 19.1c)
+
+**Problem:** Phase 19.1 partial — `nestctl todo` (19.1a) and `nestctl git` (19.1b) shipped, but daily-use plugins (Jira / Slack / Calendar) still required the generic `nestctl call jira.list_my_tickets --params '{}'` shape. JSON-string params are the wrong tool for "check what's assigned to me from the terminal."
+
+**Decision:** Add three thin clap wrappers under `nestty-cli/src/plugin_cmds/`, each following the established 19.1a/b pattern (`Subcommand` enum + `dispatch()` + per-arm `call_and_render` against the existing action surface). No new IPC, no new actions.
+
+- **`jira`**: `mine` / `ticket <key>` / `transition <key> <status>` / `comment <key> <text>` / `auth-status`. The `mine` table aligns key + status widths from the response (not fixed) so long-named projects don't push summaries off the screen. `ticket` plucks the four headline fields plus a one-paragraph ADF render so a quick check doesn't require `--json` + `jq`.
+- **`slack`**: `send <channel> <text> [--thread-ts]` / `get <channel> <ts>` / `auth-status`. **No `auth login` subcommand** — token capture is a security boundary that the plugin's own interactive `nestty-plugin-slack auth` binary owns (keyring write, env-paste UX). Wrapping it through nestctl would proxy secrets through an extra hop without value.
+- **`calendar`**: `today` / `next [--within Nh]` / `event <id>` / `auth-status`. `today` asks the action for 24h and filters client-side to the local calendar date; without that filter, a tomorrow-00:30 event would leak in because `lookahead_hours` is a duration, not a calendar-day boundary. `chrono` (clock + serde features) added to nestty-cli deps for the date math — same crate the calendar plugin already uses internally.
+
+**Posture decisions:**
+
+- **Renderers stay terse.** The `mine` view is `key  status  summary` (3 columns, no truncation); `ticket` is 4 labeled lines + a paragraph; `today` is `<start → end>  <title>` with optional `@ location`. Heavier formatting (icons, color, ANSI tables) lives in a future v2; pipeable plain text is the higher-value default.
+- **ADF rendered inline, not via the plugin.** The CLI knows how to walk one paragraph of Atlassian Document Format and pluck `text` nodes. Importing `nestty-plugin-jira` as a dep just for `event::adf_to_plain_text` would invert the crate ownership; the inline reader covers the 80% case (descriptions, comment previews) and uses `--json` as the escape hatch for the rest.
+- **`--json` everywhere.** Every subcommand emits the raw action payload under `--json`, matching the established `call_and_render` contract. Pipeable + scriptable surface for harness use (`nestctl --json jira mine | jq '.tickets[] | select(.status == "In Review")'`).
+
+**Test coverage:** the dispatch + clap surface compiles, but the only meaningful unit-testable logic is the pure render helpers (`adf_first_paragraph`, `format_event_when`). 5 tests across the two helpers cover the path-not-found cases, all-day events, and same-day range compaction. Renderer output formatting itself is verified by hand with `--json` diff (no snapshot tests yet; not worth the ceremony for ~210 LOC modules).
+
+**See:** `nestty-cli/src/plugin_cmds/jira.rs`, `slack.rs`, `calendar.rs`; wired through `nestty-cli/src/commands.rs` (enum + `unreachable!` arms in `method`/`params`) and `nestty-cli/src/main.rs` (dispatch interception before generic path).

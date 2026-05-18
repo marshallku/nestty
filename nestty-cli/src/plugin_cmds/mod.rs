@@ -16,8 +16,11 @@
 //! `commands.rs`.
 
 pub mod bookmark;
+pub mod calendar;
 pub mod context;
 pub mod git;
+pub mod jira;
+pub mod slack;
 pub mod todo;
 
 use serde_json::Value;
