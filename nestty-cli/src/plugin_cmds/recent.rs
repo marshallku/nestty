@@ -117,11 +117,14 @@ fn payload_preview(payload: &Value) -> String {
 }
 
 fn short_value(v: &Value, max: usize) -> String {
-    let raw = match v {
-        Value::String(s) => format!("\"{s}\""),
-        Value::Null => "null".to_string(),
-        other => other.to_string(),
-    };
+    // `serde_json::to_string` JSON-escapes every variant uniformly,
+    // including control bytes inside strings (`` rather than
+    // a literal ESC). Without this, an event payload that captured
+    // raw ANSI/OSC bytes (e.g. an OSC 11 `set background color`)
+    // would print verbatim and reconfigure the host terminal — a
+    // user-visible bug that turned the entire terminal background
+    // black during `nestctl recent`.
+    let raw = serde_json::to_string(v).unwrap_or_default();
     if raw.chars().count() > max {
         let truncated: String = raw.chars().take(max).collect();
         format!("{truncated}…")
@@ -190,6 +193,24 @@ mod tests {
     fn payload_preview_handles_non_object() {
         assert_eq!(payload_preview(&json!(null)), "null");
         assert_eq!(payload_preview(&json!(42)), "42");
+    }
+
+    #[test]
+    fn payload_preview_escapes_ansi_control_bytes() {
+        // Regression: raw `\x1b]11;rgb:0/0/0\x1b\\` in a payload
+        // string reached stdout and reconfigured VTE's background.
+        // The renderer must JSON-escape control bytes so the terminal
+        // sees the literal sequence, not the active control code.
+        let v = json!({"msg": "\u{1b}]11;rgb:0/0/0\u{1b}\\"});
+        let rendered = payload_preview(&v);
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "ESC must not appear unescaped in output, got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("\\u001b") || rendered.contains("\\u001B"),
+            "ESC must be JSON-escaped, got {rendered:?}"
+        );
     }
 
     #[test]
