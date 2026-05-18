@@ -22,13 +22,14 @@
 #   ./scripts/install-macos.sh --system     # /Applications + ~/.cargo/bin (sudo for /Applications)
 #   ./scripts/install-macos.sh --no-build   # skip swift build (use existing .build/release/Nestty)
 #   ./scripts/install-macos.sh --no-nestctl # skip cargo install of nestctl
+#   ./scripts/install-macos.sh --no-nesttyd # skip cargo install of nesttyd (daemon)
 #   ./scripts/install-macos.sh --no-plugins # skip building/installing plugin binaries
 #   ./scripts/install-macos.sh --launch     # open the installed app afterwards
 #
 # Notes:
-#   - nestctl always goes to ~/.cargo/bin (cargo install's default). If you
-#     want it in /usr/local/bin, run `sudo install -m755 \\
-#     ~/.cargo/bin/nestctl /usr/local/bin/nestctl` after this script.
+#   - nestctl + nesttyd always go to ~/.cargo/bin (cargo install's default).
+#     If you want them in /usr/local/bin, run `sudo install -m755 \\
+#     ~/.cargo/bin/{nestctl,nesttyd} /usr/local/bin/` after this script.
 #   - This script kills any running Nestty instance so the binary can be
 #     replaced. macOS holds an exclusive lock on a running .app's exec.
 #   - First launch may show Gatekeeper warning if the .app is unsigned;
@@ -48,6 +49,7 @@ APP_NAME="Nestty.app"
 DO_BUILD=true
 SYSTEM_INSTALL=false
 DO_NESTCTL=true
+DO_NESTTYD=true
 DO_PLUGINS=true
 DO_LAUNCH=false
 
@@ -74,6 +76,7 @@ while [[ $# -gt 0 ]]; do
         --system)      SYSTEM_INSTALL=true ; shift ;;
         --no-build)    DO_BUILD=false ; shift ;;
         --no-nestctl)  DO_NESTCTL=false ; shift ;;
+        --no-nesttyd)  DO_NESTTYD=false ; shift ;;
         --no-plugins)  DO_PLUGINS=false ; shift ;;
         --launch)      DO_LAUNCH=true ; shift ;;
         -h|--help)
@@ -189,13 +192,22 @@ mkdir -p "$APP_DEST" 2>/dev/null || $SUDO_APP mkdir -p "$APP_DEST"
 $SUDO_APP rm -rf "$APP_DEST/$APP_NAME"
 $SUDO_APP mv "$STAGING" "$APP_DEST/$APP_NAME"
 
-# 6. Install nestctl via cargo install (writes to ~/.cargo/bin). This
-#    is the canonical CLI install path on macOS — `cargo install nestty-cli`
-#    fails (not on crates.io) and `cargo install --path .` fails (workspace
-#    root is a virtual manifest), so we wrap the correct invocation here.
+# 6. Install nestctl + nesttyd via cargo install (writes to ~/.cargo/bin).
+#    Same rationale as nestctl: `cargo install <name>` fails (not on
+#    crates.io) and `cargo install --path .` fails (workspace virtual
+#    manifest), so we always pass `--path <crate-dir>`.
+#
+#    nesttyd is the background daemon (status bar, triggers, plugin
+#    runtime). The Swift app auto-spawns it on launch when missing, so
+#    a fresh install without nesttyd in PATH would warn-and-skip the
+#    status bar / plugin features.
 if $DO_NESTCTL; then
     echo "==> cargo install --path nestty-cli (nestctl → ~/.cargo/bin)"
     cargo install --path "$REPO_ROOT/nestty-cli"
+fi
+if $DO_NESTTYD; then
+    echo "==> cargo install --path nestty-daemon (nesttyd → ~/.cargo/bin)"
+    cargo install --path "$REPO_ROOT/nestty-daemon"
 fi
 
 # 7. Build + install macOS-buildable plugins. PluginSupervisor (PR 3) reads
@@ -250,15 +262,21 @@ EOF
 if $DO_NESTCTL; then
     echo "  $HOME/.cargo/bin/nestctl"
 fi
+if $DO_NESTTYD; then
+    echo "  $HOME/.cargo/bin/nesttyd"
+fi
 if $DO_PLUGINS; then
     echo "  $PLUGIN_DEST/{$(IFS=,; echo "${MACOS_PLUGINS[*]}")}"
 fi
 cat <<'EOF'
 
 Next:
-  - Launch nestty via Spotlight, Launchpad, or `open -a nestty`.
-  - Generate a default config: `nestctl --init-config`-equivalent does
-    not exist on macOS yet; create ~/.config/nestty/config.toml manually
-    or copy from examples/config.toml.
+  - Launch the GUI: `open -a Nestty` (or Spotlight / Launchpad).
+  - CLI helpers on the app binary itself:
+      Nestty.app/Contents/MacOS/Nestty --version
+      Nestty.app/Contents/MacOS/Nestty --config-path
+      Nestty.app/Contents/MacOS/Nestty --init-config   # writes ~/.config/nestty/config.toml if missing
+    (Many users alias `nestty` to that binary so `nestty --config-path` works.)
   - Verify a plugin is alive: `nestctl call echo.ping --params '{"hi":"there"}'`
+  - Tail recent daemon events:    `nestctl recent`
 EOF

@@ -544,8 +544,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Config Watcher
 
     private func startConfigWatcher() {
-        let configURL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config/nestty/config.toml")
+        // Route through `NesttyConfig.configPath()` so XDG_CONFIG_HOME
+        // overrides also reach the watcher — otherwise the watcher would
+        // observe the default ~/.config/ path while Swift load, Rust
+        // daemon, nestctl, and `nestty --config-path` all use the XDG
+        // location, and edits there wouldn't trigger live reload.
+        let configURL = NesttyConfig.configPath()
         let watcher = ConfigWatcher(url: configURL)
         watcher.onChange = { [weak self] in self?.handleConfigChange() }
         watcher.start()

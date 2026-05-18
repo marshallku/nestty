@@ -244,11 +244,29 @@ pub struct NesttyConfig {
 }
 
 impl NesttyConfig {
+    /// `$XDG_CONFIG_HOME/nestty/config.toml`, else `~/.config/nestty/
+    /// config.toml`. macOS deliberately overrides `dirs::config_dir()`
+    /// (which would point at `~/Library/Application Support/`) so the
+    /// Swift renderer (which hardcodes `~/.config/nestty/`), the Rust
+    /// daemon, and `nestctl` all load the same file — and users with
+    /// XDG-style dotfiles repos see their config on macOS too.
     pub fn config_path() -> PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("/etc"))
-            .join("nestty")
-            .join("config.toml")
+        Self::config_dir().join("nestty").join("config.toml")
+    }
+
+    fn config_dir() -> PathBuf {
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
+            && !xdg.is_empty()
+        {
+            return PathBuf::from(xdg);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(home) = dirs::home_dir() {
+                return home.join(".config");
+            }
+        }
+        dirs::config_dir().unwrap_or_else(|| PathBuf::from("/etc"))
     }
 
     pub fn load() -> Result<Self> {

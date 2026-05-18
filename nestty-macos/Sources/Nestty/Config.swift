@@ -114,12 +114,25 @@ struct NesttyConfig {
     /// and the Rust side already has the canonical Deserialize impl.
     let triggers: [[String: Any]]
 
-    static func load() -> NesttyConfig {
-        let configURL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config")
+    /// `$XDG_CONFIG_HOME/nestty/config.toml`, else `~/.config/nestty/
+    /// config.toml`. Mirrors `nestty_core::config::NesttyConfig::
+    /// config_path()` so Swift renderer, Rust daemon, and nestctl all
+    /// agree on the canonical location.
+    static func configPath() -> URL {
+        let env = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"]
+        let base: URL = if let env, !env.isEmpty {
+            URL(fileURLWithPath: env)
+        } else {
+            FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".config")
+        }
+        return base
             .appendingPathComponent("nestty")
             .appendingPathComponent("config.toml")
+    }
 
+    static func load() -> NesttyConfig {
+        let configURL = configPath()
         guard let contents = try? String(contentsOf: configURL, encoding: .utf8) else {
             return .defaults
         }
