@@ -619,14 +619,6 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             ctx.fill(bounds)
         }
 
-        // Cursor first (under the text), so block-style cursor
-        // shows its character on top via the text loop. Hidden
-        // (style=0) — short-circuit. Phase 3.4 will overlay the
-        // character with `caretTextColor` when the cursor cell is a
-        // block; for now the foreground glyph just draws over the
-        // accent fill.
-        drawCursor(snap.cursor)
-
         // CTLineDraw uses CoreGraphics-native y-up glyph orientation.
         // Our view is `isFlipped = true` (so row 0 is at the top
         // visually) — without this textMatrix flip the glyphs render
@@ -644,6 +636,14 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             guard runs.count > 0, utf8.count > 0 else { continue }
             drawRow(row: row, runs: runs, utf8: utf8, ctx: ctx)
         }
+
+        // Cursor on top of the glyph layer: nvim/htop/etc. paint the
+        // cursor cell with their own highlight group (CursorLine,
+        // Cursor) which previously covered an early-drawn cursor. For
+        // block style we then re-render the cell glyph in
+        // theme.background so the character under the cursor stays
+        // readable (xterm/iTerm2/Terminal.app convention).
+        drawCursor(snap: snap, ctx: ctx)
 
         // Selection highlight last so it tints OVER the text instead
         // of getting covered by per-cell bg fills. theme.surface2 at
@@ -753,20 +753,21 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     }
 
     /// Cursor render. Style 0 = hidden (skip). Block (1) fills the
-    /// whole cell. Beam (2) is a 2-px vertical bar at the cell's
-    /// leading edge. Underline (3) is a 2-px horizontal bar at the
-    /// cell's bottom. When the window isn't key (e.g. user switched
-    /// apps), block style draws as a hollow outline so the user can
-    /// tell the terminal won't receive input — Terminal.app + iTerm2
-    /// do the same.
-    private func drawCursor(_ cursor: NesttyCursor) {
+    /// whole cell, then re-renders the cell glyph in theme.background
+    /// so the character under the cursor stays legible. Beam (2) is a
+    /// 2-px vertical bar at the cell's leading edge. Underline (3)
+    /// is a 2-px horizontal bar at the cell's bottom. When the window
+    /// isn't key (e.g. user switched apps), block style draws as a
+    /// hollow outline — Terminal.app + iTerm2 do the same.
+    private func drawCursor(snap: NesttyTermFFI.Snapshot, ctx: CGContext) {
+        let cursor = snap.cursor
         guard cursor.style != 0,
+              cellWidth > 0, cellHeight > 0,
               // Honor TUI-requested blink: skip the draw on the OFF
               // phase so the cursor actually disappears between
               // `blinkInterval` ticks. Steady cursors (`blink == 0`)
               // ignore `blinkVisible` entirely.
-              cursor.blink == 0 || blinkVisible,
-              let ctx = NSGraphicsContext.current?.cgContext
+              cursor.blink == 0 || blinkVisible
         else { return }
         let x = CGFloat(cursor.col) * cellWidth
         let y = CGFloat(cursor.row) * cellHeight
@@ -779,6 +780,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             if isKey {
                 ctx.setFillColor(color)
                 ctx.fill(cell)
+                redrawCursorGlyph(snap: snap, ctx: ctx)
             } else {
                 ctx.setStrokeColor(color)
                 ctx.setLineWidth(1)
@@ -799,6 +801,85 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         default:
             break
         }
+    }
+
+    /// Paint the glyph at the cursor cell using theme.background as
+    /// the foreground color, so it stands out against the accent
+    /// block underneath. Honors bold/italic flags on the underlying
+    /// run so styled text under the cursor still reads correctly.
+    private func redrawCursorGlyph(snap: NesttyTermFFI.Snapshot, ctx: CGContext) {
+        let cursor = snap.cursor
+        let runs = snap.rowRuns(cursor.row)
+        let utf8 = snap.rowUtf8(cursor.row)
+
+        // Runs are emitted per cell (or per wide-cell-pair), so the
+        // cursor sits inside exactly one run. Wide chars: cursor lands
+        // on the leading half, so start_col == cursor.col still holds.
+        var hit: NesttyRun?
+        for i in 0 ..< runs.count {
+            let r = runs[i]
+            if r.start_col <= cursor.col, cursor.col < r.end_col {
+                hit = r
+                break
+            }
+        }
+        guard let run = hit else { return }
+
+        let len = Int(run.utf8_len)
+        let offset = Int(run.utf8_offset)
+        guard offset + len <= utf8.count else { return }
+
+        // Pick the byte range and draw position. Three shapes:
+        //   1. Aggregated uniform-ASCII run (multi-cell, all same byte):
+        //      take exactly one byte and draw at the cursor cell's x.
+        //      Drawing the full run would overpaint adjacent cells.
+        //   2. Wide char (WIDE_LEADING flag, 2-cell span): draw the
+        //      full utf8 at the run's start (= cursor.col for the
+        //      leading half).
+        //   3. Single cell, possibly with combining marks: draw the
+        //      full utf8 at the run's start (= cursor.col).
+        let flagBold: UInt16 = 1 << 0
+        let flagItalic: UInt16 = 1 << 1
+        let flagWideLeading: UInt16 = 1 << 7
+        let runSpan = run.end_col - run.start_col
+        let isWide = run.flags & flagWideLeading != 0
+        let isAggregatedUniform = !isWide && runSpan > 1
+
+        let drawBytes: UnsafeBufferPointer<UInt8>
+        let drawX: CGFloat
+        if isAggregatedUniform {
+            // Every byte in the run is the same ASCII char by
+            // construction (see walk_row in nestty-term).
+            drawBytes = UnsafeBufferPointer(rebasing: utf8[offset ..< offset + 1])
+            drawX = CGFloat(cursor.col) * cellWidth
+        } else {
+            drawBytes = UnsafeBufferPointer(rebasing: utf8[offset ..< offset + len])
+            drawX = CGFloat(run.start_col) * cellWidth
+        }
+        guard
+            let str = String(bytes: drawBytes, encoding: .utf8),
+            !str.isEmpty,
+            str != " "
+        else { return }
+
+        let isBold = run.flags & flagBold != 0
+        let isItalic = run.flags & flagItalic != 0
+        let runFont: NSFont = switch (isBold, isItalic) {
+        case (true, true): boldItalicFont
+        case (true, false): boldFont
+        case (false, true): italicFont
+        case (false, false): font
+        }
+
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: runFont,
+            .foregroundColor: NSColor(cgColor: theme.background.nsColor.cgColor) ?? .black,
+        ]
+        let attr = NSAttributedString(string: str, attributes: attrs)
+        let line = CTLineCreateWithAttributedString(attr)
+        let baselineY = CGFloat(cursor.row) * cellHeight + ascent
+        ctx.textPosition = CGPoint(x: drawX, y: baselineY)
+        CTLineDraw(line, ctx)
     }
 
     private func drawRow(
@@ -1088,7 +1169,12 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         }
         if lines != 0 {
             h.scrollLines(Int32(lines))
-            needsDisplay = true
+            // No needsDisplay here — the vsync displayLink will see
+            // the state-hash change on its next tick (≤16ms) and
+            // schedule the redraw with a FRESH snapshot. Marking
+            // dirty inline caused a double-render per scroll event:
+            // AppKit drew the stale snapshotCache, then vsync drew
+            // again with the post-scroll snapshot.
         }
     }
 
@@ -1213,19 +1299,23 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     private func handleScrollKey(_ event: NSEvent, mods: NSEvent.ModifierFlags) -> Bool {
         guard let h = termHandle else { return false }
         let kc = event.keyCode
+        // Same pattern as scrollWheel: skip needsDisplay because the
+        // vsync displayLink will pick up the state-hash change within
+        // one frame and trigger a draw with a fresh snapshot. Marking
+        // dirty inline caused a stale draw before the vsync redraw.
         if mods.contains(.command) {
             switch kc {
-            case KeyCode.up: h.scrollLines(1); needsDisplay = true; return true
-            case KeyCode.down: h.scrollLines(-1); needsDisplay = true; return true
-            case KeyCode.home: h.scrollToTop(); needsDisplay = true; return true
-            case KeyCode.end: h.scrollToBottom(); needsDisplay = true; return true
+            case KeyCode.up: h.scrollLines(1); return true
+            case KeyCode.down: h.scrollLines(-1); return true
+            case KeyCode.home: h.scrollToTop(); return true
+            case KeyCode.end: h.scrollToBottom(); return true
             default: break
             }
         }
         if mods.contains(.shift) {
             switch kc {
-            case KeyCode.pageUp: h.scrollPageUp(); needsDisplay = true; return true
-            case KeyCode.pageDown: h.scrollPageDown(); needsDisplay = true; return true
+            case KeyCode.pageUp: h.scrollPageUp(); return true
+            case KeyCode.pageDown: h.scrollPageDown(); return true
             default: break
             }
         }

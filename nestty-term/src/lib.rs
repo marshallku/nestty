@@ -639,8 +639,12 @@ fn selection_range_for_ffi(term: &Term<NesttyListener>) -> NesttySelectionRange 
 }
 
 /// Walk a single display line into a `Row`. Groups consecutive cells
-/// with identical attributes into runs; appends each cell's char + any
-/// zero-width combining marks into the row's utf8 buffer.
+/// with identical attributes AND identical single-byte ASCII char into
+/// one run so the renderer makes one CTLine per span instead of per
+/// cell — the dominant cost on idle/scrollback frames where most cells
+/// are spaces. The aggregation is intentionally conservative:
+/// uniform-ASCII only (so the cursor-cell glyph re-render picks any
+/// byte and gets the right char), no wide chars, no combining marks.
 fn walk_row(
     grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
     line: Line,
@@ -650,6 +654,11 @@ fn walk_row(
 ) -> Row {
     let mut utf8: Vec<u8> = Vec::new();
     let mut runs: Vec<NesttyRun> = Vec::new();
+    // Side-channel: for each pushed run, the ASCII byte every cell in
+    // that run shares — or None if the run is non-uniform (multi-byte
+    // char, combining marks, wide char, or mixed contents). Only
+    // Some-valued entries can be extended by `try_extend_last_run`.
+    let mut run_uniform: Vec<Option<u8>> = Vec::new();
     let mut col: u16 = 0;
 
     while col < cols {
@@ -670,18 +679,6 @@ fn walk_row(
         } else {
             1
         };
-        let utf8_offset = utf8.len() as u32;
-
-        let mut buf = [0u8; 4];
-        utf8.extend_from_slice(cell.c.encode_utf8(&mut buf).as_bytes());
-        // Combining marks live in CellExtra.zerowidth — fold them
-        // into the same run's utf8 so CoreText shapes them with
-        // their base glyph.
-        for combine in cell.zerowidth().unwrap_or(&[]) {
-            utf8.extend_from_slice(combine.encode_utf8(&mut buf).as_bytes());
-        }
-
-        let utf8_len = utf8.len() as u32 - utf8_offset;
 
         let mut run_flags = cell_flags_to_ffi(cell.flags);
         if span_cols == 2 {
@@ -701,6 +698,60 @@ fn walk_row(
         } else {
             0
         };
+        let hyperlink_id = cell
+            .hyperlink()
+            .map(|h| {
+                let key = (h.id().to_owned(), h.uri().to_owned());
+                if let Some(idx) = hyperlink_index_by_key.get(&key) {
+                    return *idx;
+                }
+                hyperlinks.push(key.1.clone());
+                let new_idx = hyperlinks.len() as u32; // 1-based
+                hyperlink_index_by_key.insert(key, new_idx);
+                new_idx
+            })
+            .unwrap_or(0);
+
+        // Aggregation eligibility: single-cell, ASCII char, no
+        // combining marks. Multi-byte chars, wide chars, and cells
+        // with combining marks each get their own run so cursor-cell
+        // glyph extraction stays a simple "pick the run's bytes".
+        let has_zw = cell.zerowidth().is_some_and(|z| !z.is_empty());
+        let cell_byte: Option<u8> = if span_cols == 1 && !has_zw && cell.c.is_ascii() {
+            Some(cell.c as u8)
+        } else {
+            None
+        };
+
+        if let Some(b) = cell_byte
+            && let (Some(last), Some(last_uniform)) = (runs.last_mut(), run_uniform.last_mut())
+            && *last_uniform == Some(b)
+            && last.fg_rgba == fg
+            && last.bg_rgba == bg
+            && last.flags == run_flags
+            && last.underline_color_rgba == underline_color
+            && last.underline_style == underline_style
+            && last.hyperlink_id == hyperlink_id
+        {
+            // Extend the previous run by one column. utf8 stays
+            // uniform because we appended the same byte.
+            utf8.push(b);
+            last.utf8_len += 1;
+            last.end_col += 1;
+            col += 1;
+            continue;
+        }
+
+        let utf8_offset = utf8.len() as u32;
+        let mut buf = [0u8; 4];
+        utf8.extend_from_slice(cell.c.encode_utf8(&mut buf).as_bytes());
+        // Combining marks live in CellExtra.zerowidth — fold them
+        // into the same run's utf8 so CoreText shapes them with
+        // their base glyph.
+        for combine in cell.zerowidth().unwrap_or(&[]) {
+            utf8.extend_from_slice(combine.encode_utf8(&mut buf).as_bytes());
+        }
+        let utf8_len = utf8.len() as u32 - utf8_offset;
 
         runs.push(NesttyRun {
             start_col: col,
@@ -713,20 +764,9 @@ fn walk_row(
             underline_style,
             reserved: 0,
             underline_color_rgba: underline_color,
-            hyperlink_id: cell
-                .hyperlink()
-                .map(|h| {
-                    let key = (h.id().to_owned(), h.uri().to_owned());
-                    if let Some(idx) = hyperlink_index_by_key.get(&key) {
-                        return *idx;
-                    }
-                    hyperlinks.push(key.1.clone());
-                    let new_idx = hyperlinks.len() as u32; // 1-based
-                    hyperlink_index_by_key.insert(key, new_idx);
-                    new_idx
-                })
-                .unwrap_or(0),
+            hyperlink_id,
         });
+        run_uniform.push(cell_byte);
 
         col += span_cols as u16;
     }
