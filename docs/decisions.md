@@ -531,3 +531,36 @@ Both are documented v2 work. The fallback behavior is "next launch has a smaller
 - `timeout_with_default_does_not_leak_upstream_action_result` — regression coverage for codex C1 round 2.
 
 **See:** `nestty-core/src/trigger.rs::try_promote_or_drop_preflight` (promotion-time interpolation), `nestty-core/src/trigger.rs::build_awaited_payload` (new action_result arg), `nestty-core/src/trigger.rs::resolve_token` / `resolve_token_value` (action_result branch). The interpolator refactor preserves the no-action_result code path for `Trigger::interpolate` so action `params` interpolation is unaffected — only the awaited-event pathway sees action_result.
+
+
+## 33. Git workspace file-watcher events (Phase 17.2)
+
+**Problem:** Phase 17.1 shipped CRUD actions for git workspaces and worktrees but no live "something changed in the repo" signal. Status bar widgets, a future git panel, and triggers that want to react to branch/worktree state changes without polling actions all need an event channel.
+
+**Decision:** Add a polling watcher per configured workspace in `plugins/git/src/watcher.rs`. Each watcher thread snapshots `.git/HEAD` (raw line), `.git/refs/heads/**` (recursive loose-ref names), and `.git/worktrees/*` (immediate subdirs) at a fixed interval and emits diffs to the plugin's writer channel as `event.publish` frames.
+
+**Polling, not `notify`:**
+
+- Dependency-free — no new crate, no platform conditional. The `notify` crate would add inotify (Linux) + FSEvents (macOS) backends each with their own pitfalls (FSEvents coalesces edits inside a directory tree, inotify watches per-fd hit a kernel limit fast on many workspaces).
+- For status-bar / live-indicator use, 2 s lag is the same order as the user's own click cadence.
+- Cheap: a snapshot is `read_to_string(.git/HEAD)` + recursive readdir of refs/heads/ + readdir of worktrees/ — bytes-level fs traffic per workspace per poll.
+- The cost of "not real-time" is paid only by these advisory events. `git.worktree_add` and friends still publish their own `<action>.completed` via Phase 14.1's registry fan-out, so chained triggers (Vision Flow 3) hit the bus the instant the action returns.
+
+**Posture decisions:**
+
+- **Loose refs only.** `.git/packed-refs` is intentionally NOT scanned. Branches that exist only there are pre-established as of `git gc` time and don't represent user-initiated changes within the watching window. The trade-off: rare, but a `git gc` running mid-session could collapse loose refs into packed-refs and the watcher would emit spurious `branch_deleted` for them. Acceptable for v1.
+- **HEAD-cleared suppresses `git.checkout`.** If `.git/HEAD` becomes unreadable (transient race during operations), the snapshot's `head` is `None`. The diff explicitly skips emitting `checkout {head: null}` — "branch went away" is the `branch_deleted` signal's job. Avoids noisy null-HEAD events during transient races. Tested.
+- **First-snapshot baseline.** The watcher loop's first iteration is the baseline; no events fire until the second poll. So a branch created between nestty start and the first snapshot is "already there" from the watcher's perspective. Right contract for a polling watcher.
+- **Sorted diffs.** Multiple changes within one poll interval are emitted in deterministic order: HEAD first, then alphabetically-sorted creates, deletes, worktree creates, worktree deletes. Avoids racy test assertions and lets downstream triggers rely on a stable order if they care.
+
+**Threading model:** one detached `thread::spawn` per workspace. No clean shutdown — when the plugin's main thread exits (stdin EOF or SIGTERM from supervisor), the OS reaps the process and the watcher threads die with it. A stop flag (`AtomicBool`) is plumbed through so the loop short-circuits between sleeps, but the plugin never actively sets it today; it's wired for a future shutdown-notification handler.
+
+**Init handshake gate (codex review I1 round 1):** Watcher threads sleep on an `initialized: Arc<AtomicBool>` until `handle_frame` flips it on the `initialized` notification, BEFORE taking the baseline snapshot. Without the gate, a `NESTTY_GIT_POLL_MS=250` setup with slow plugin startup could publish an event before the supervisor's `initialize` → `initialized` handshake completes, and the host would drop it as out-of-protocol.
+
+**Gitdir resolution for secondary worktrees (codex review C1 round 1):** `Config` validation accepts ANY valid git working tree via `git rev-parse --is-inside-work-tree`, including secondary worktrees where `.git` is a FILE (gitlink: `gitdir: <primary>/.git/worktrees/<name>`) rather than a directory. The naive `<path>/.git/HEAD` read would silently fail for those, and the watcher would emit nothing for a valid workspace. Snapshot now delegates to `git rev-parse --git-dir` (per-worktree gitdir, where HEAD lives) + `--git-common-dir` (shared across worktrees, where refs/heads/ and worktrees/ live). Two `git` shell-outs per snapshot — cheap; could be cached but a 2s cadence makes caching premature. E2E test `snapshot_secondary_worktree_resolves_via_git_rev_parse` verifies `.git`-as-file resolution against a real repo.
+
+**Activation flipped to `onStartup`:** Phase 17.1 ran the plugin lazily (`onAction:git.*`) because actions were the only surface. With watchers, the plugin must be alive whenever nestty runs so events flow between action calls. Cheap: a workspace-less config (or zero workspaces) spawns no threads and just sits at stdin.
+
+**Configurability:** `NESTTY_GIT_POLL_MS` overrides the default 2000 ms; values below 250 ms are clamped to protect against accidental tight loops. No "interval = 0 = disabled" mode — to disable, remove the workspace entries or `kill -9` the plugin.
+
+**See:** `plugins/git/src/watcher.rs` (snapshot + diff + spawn + 9 unit tests including a real-`git` E2E), `plugins/git/src/main.rs` (`watcher::spawn(...)` after Config load), `plugins/git/plugin.toml` (version bump to 0.2.0, `activation = "onStartup"`, description mentions emitted events).

@@ -9,8 +9,11 @@
 # side bookkeeping required.
 #
 # Filesystem-driven events (`git.worktree_created`,
-# `git.branch_created`, `git.checkout`, ...) are slice 2 of Phase 17
-# and are NOT yet published — uncomment after that lands.
+# `git.worktree_removed`, `git.branch_created`, `git.branch_deleted`,
+# `git.checkout`) ship in Phase 17 slice 2 and are now published by
+# the per-workspace polling watcher (`NESTTY_GIT_POLL_MS` tunable,
+# default 2000 ms). Payload: `{workspace, head}` for checkout,
+# `{workspace, name}` otherwise.
 
 # ---------------------------------------------------------------------
 # 1. Vision Flow 3 (the killer demo): when `git.worktree_add`
@@ -20,10 +23,6 @@
 #    git.worktree_add` upstream to get the full chain
 #    `Todo start → worktree → claude tab`.
 #
-#    Note: `prompt` field is rejected by claude.start in slice 1
-#    (Phase 18.1) — it lands in 18.2 once tmux send-keys timing
-#    is designed. The user pastes the prompt into claude after
-#    the tab opens.
 # ---------------------------------------------------------------------
 [[triggers]]
 name = "worktree-then-claude"

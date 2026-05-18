@@ -1,18 +1,17 @@
 [plugin]
 name = "git"
 title = "Git Workspaces"
-version = "0.1.0"
-description = "Lightweight git workspace + worktree plugin. Reads workspaces from ~/.config/nestty/workspaces.toml. Provides git.list_workspaces / list_worktrees / worktree_add / worktree_remove / current_branch / status — every call is an argv-vector shell-out to `git`, no shell strings."
+version = "0.2.0"
+description = "Lightweight git workspace + worktree plugin. Reads workspaces from ~/.config/nestty/workspaces.toml. Provides git.list_workspaces / list_worktrees / worktree_add / worktree_remove / current_branch / status (every call is an argv-vector shell-out to `git`, no shell strings). Emits git.worktree_created / git.worktree_removed / git.branch_created / git.branch_deleted / git.checkout via a per-workspace polling watcher on .git/HEAD, .git/refs/heads/, .git/worktrees/."
 
 [[services]]
 name = "main"
 exec = "nestty-plugin-git"
-# Lazy: actions don't need a long-lived stream, so onAction is
-# enough. File-watcher-driven events (git.worktree_created,
-# git.branch_created, etc.) are deferred to slice 2 — at that
-# point this should switch to onStartup so the watcher is alive
-# even before the first action call.
-activation = "onAction:git.*"
+# onStartup: the polling watcher must be alive whenever nestty runs
+# so branch/checkout/worktree changes between action calls still
+# emit. Cheap — 2s default poll, ~few file reads per workspace.
+# Tunable via NESTTY_GIT_POLL_MS.
+activation = "onStartup"
 restart = "on-crash"
 provides = [
     "git.list_workspaces",
@@ -26,3 +25,5 @@ subscribes = []
 # Optional env:
 #   NESTTY_GIT_WORKSPACES_FILE — override the default
 #                              ~/.config/nestty/workspaces.toml location.
+#   NESTTY_GIT_POLL_MS         — watcher poll interval in ms
+#                              (default 2000, min clamped to 250).

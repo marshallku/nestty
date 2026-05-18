@@ -20,9 +20,11 @@
 //! - `git.status {workspace?, path?}` — `path` form lets callers
 //!   inspect a specific worktree directly.
 //!
-//! Activation `onAction:git.*` (lazy). File-watcher events
-//! (`git.worktree_created`, `git.branch_created`, ...) are deferred
-//! to Phase 17 slice 2 — not blocking Vision Flow 3.
+//! Activation `onStartup`: the per-workspace polling watcher
+//! (Phase 17 slice 2) emits `git.worktree_created` /
+//! `git.worktree_removed` / `git.branch_created` /
+//! `git.branch_deleted` / `git.checkout` and must be alive whenever
+//! nestty runs. Tunable via `NESTTY_GIT_POLL_MS` (default 2000 ms).
 //!
 //! Cross-platform: `git` is the only binary dependency. Works on
 //! Linux + macOS without OS-specific gates. (No keyring, no
@@ -30,6 +32,7 @@
 
 mod config;
 mod git;
+mod watcher;
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Component, Path, PathBuf};
@@ -70,6 +73,20 @@ fn main() {
     });
 
     let initialized = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // Spawn one polling watcher thread per workspace. The watchers
+    // emit `git.worktree_created` / `git.worktree_removed` /
+    // `git.branch_created` / `git.branch_deleted` / `git.checkout`
+    // events through the same writer channel actions use. Events are
+    // held back until the host's `initialize` → `initialized` handshake
+    // completes.
+    watcher::spawn(
+        config.clone(),
+        tx.clone(),
+        stop.clone(),
+        initialized.clone(),
+    );
 
     let reader = BufReader::new(stdin.lock());
     for line in reader.lines() {
