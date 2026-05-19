@@ -285,7 +285,68 @@ fn build_trigger_engine(
             .collect();
         Ok(serde_json::json!({ "events": arr }))
     });
+    register_notify_show(
+        actions,
+        nestty_core::notifier::platform_notifier().map(Arc::from),
+    );
     engine
+}
+
+/// `notify.show` — desktop toast. Registered as `blocking_silent` so
+/// the ~10 ms `notify-send` subprocess runs on the action thread pool
+/// instead of stalling the trigger pump, and so its own `.completed`
+/// event doesn't fan-out (the toast IS the user signal). The same
+/// registration also runs on the GUI's in-process registry — see
+/// `nestty-linux/src/window.rs` — so triggers fire regardless of
+/// whether the daemon hosts the engine or the GUI's `LiveTriggerSink`
+/// path resolves the action. `notifier` is plumbed as an arg so tests
+/// can inject a `NoopNotifier` without spawning real subprocesses.
+fn register_notify_show(
+    actions: &Arc<nestty_core::action_registry::ActionRegistry>,
+    notifier: Option<Arc<dyn nestty_core::notifier::Notifier>>,
+) {
+    actions.register_blocking_silent("notify.show", move |params| {
+        let title = match params.get("title").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => {
+                return Err(invalid_params(
+                    "notify.show requires non-empty `title` string",
+                ));
+            }
+        };
+        let body = match params.get("body") {
+            Some(v) if v.is_null() => String::new(),
+            None => String::new(),
+            Some(v) => match v.as_str() {
+                Some(s) => s.to_string(),
+                None => {
+                    return Err(invalid_params("notify.show `body` must be a string"));
+                }
+            },
+        };
+        let level: nestty_core::notifier::Level = match params.get("level") {
+            None | Some(serde_json::Value::Null) => nestty_core::notifier::Level::default(),
+            Some(v) => serde_json::from_value(v.clone()).map_err(|_| {
+                invalid_params("notify.show `level` must be one of `info`, `warn`, `error`")
+            })?,
+        };
+        match &notifier {
+            Some(n) => match n.notify(&title, &body, level) {
+                Ok(()) => Ok(serde_json::json!({ "shown": true })),
+                Err(e) => {
+                    log::warn!("notify.show failed: {e}");
+                    Err(internal_error(format!("notify subprocess: {e}")))
+                }
+            },
+            None => {
+                // Platform has no concrete Notifier yet (only Linux and
+                // macOS are wired). Drop the toast with a debug-level
+                // log; downstream chains don't need to fail.
+                log::debug!("notify.show: no Notifier for this platform; dropping");
+                Ok(serde_json::json!({ "shown": false, "reason": "no_notifier" }))
+            }
+        }
+    });
 }
 
 /// Build + reconcile PumpState. Only call this when the daemon is
@@ -880,5 +941,161 @@ event_kind = "panel.focused"
         handle.join().expect("watcher thread joined");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    // ---- notify.show registration ----
+
+    fn fresh_registry() -> Arc<nestty_core::action_registry::ActionRegistry> {
+        Arc::new(nestty_core::action_registry::ActionRegistry::new())
+    }
+
+    #[test]
+    fn notify_show_rejects_missing_title() {
+        let actions = fresh_registry();
+        let notifier = Arc::new(nestty_core::notifier::NoopNotifier::default());
+        register_notify_show(&actions, Some(notifier.clone()));
+        let err = actions
+            .invoke("notify.show", serde_json::json!({"body": "hi"}))
+            .unwrap_err();
+        assert_eq!(err.code, "invalid_params");
+        assert!(notifier.captured.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn notify_show_rejects_empty_title() {
+        let actions = fresh_registry();
+        let notifier = Arc::new(nestty_core::notifier::NoopNotifier::default());
+        register_notify_show(&actions, Some(notifier.clone()));
+        let err = actions
+            .invoke("notify.show", serde_json::json!({"title": "", "body": "x"}))
+            .unwrap_err();
+        assert_eq!(err.code, "invalid_params");
+        assert!(notifier.captured.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn notify_show_rejects_bad_level_string() {
+        let actions = fresh_registry();
+        let notifier = Arc::new(nestty_core::notifier::NoopNotifier::default());
+        register_notify_show(&actions, Some(notifier.clone()));
+        let err = actions
+            .invoke(
+                "notify.show",
+                serde_json::json!({"title": "t", "body": "b", "level": "loud"}),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "invalid_params");
+        assert!(notifier.captured.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn notify_show_invokes_notifier_with_defaults() {
+        // Blocking action returns `{"queued": true}` synchronously; the
+        // handler runs on the action thread pool. Use try_dispatch with
+        // a blocking callback so the test can read the captured side
+        // effect deterministically.
+        let actions = fresh_registry();
+        let notifier = Arc::new(nestty_core::notifier::NoopNotifier::default());
+        register_notify_show(&actions, Some(notifier.clone()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        actions.try_dispatch(
+            "notify.show",
+            serde_json::json!({"title": "hello", "body": "world"}),
+            Box::new(move |r| {
+                tx.send(r).ok();
+            }),
+        );
+        let result = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("handler ran");
+        assert!(result.is_ok(), "got error: {result:?}");
+        let captured = notifier.captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        let (title, body, level) = &captured[0];
+        assert_eq!(title, "hello");
+        assert_eq!(body, "world");
+        assert_eq!(*level, nestty_core::notifier::Level::Info);
+    }
+
+    #[test]
+    fn notify_show_accepts_level_warn_and_error() {
+        let actions = fresh_registry();
+        let notifier = Arc::new(nestty_core::notifier::NoopNotifier::default());
+        register_notify_show(&actions, Some(notifier.clone()));
+        for level_str in ["warn", "error"] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            actions.try_dispatch(
+                "notify.show",
+                serde_json::json!({"title": "t", "body": "b", "level": level_str}),
+                Box::new(move |r| {
+                    tx.send(r).ok();
+                }),
+            );
+            rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        }
+        let captured = notifier.captured.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].2, nestty_core::notifier::Level::Warn);
+        assert_eq!(captured[1].2, nestty_core::notifier::Level::Error);
+    }
+
+    #[test]
+    fn notify_show_drops_when_no_platform_notifier() {
+        let actions = fresh_registry();
+        register_notify_show(&actions, None);
+        let (tx, rx) = std::sync::mpsc::channel();
+        actions.try_dispatch(
+            "notify.show",
+            serde_json::json!({"title": "t", "body": "b"}),
+            Box::new(move |r| {
+                tx.send(r).ok();
+            }),
+        );
+        let result = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let value = result.expect("handler should return Ok even with no notifier");
+        assert_eq!(value["shown"], false);
+        assert_eq!(value["reason"], "no_notifier");
+    }
+
+    #[test]
+    fn notify_show_runs_on_blocking_pool_and_does_not_fan_out_completion() {
+        // Regression guard: blocking-silent means the subprocess runs
+        // on the action thread pool (not the calling thread) AND no
+        // `<action>.completed` event spams the bus. Build a registry
+        // with a completion bus + subscribe to `notify.show.completed`
+        // before invoking.
+        let bus = Arc::new(nestty_core::event_bus::EventBus::new());
+        let actions = Arc::new(
+            nestty_core::action_registry::ActionRegistry::with_completion_bus(bus.clone()),
+        );
+        let completed_rx = bus.subscribe("notify.show.completed");
+        let notifier = Arc::new(nestty_core::notifier::NoopNotifier::default());
+        register_notify_show(&actions, Some(notifier.clone()));
+        assert!(actions.has("notify.show"));
+        assert!(actions.is_blocking("notify.show"));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        actions.try_dispatch(
+            "notify.show",
+            serde_json::json!({"title": "t", "body": "b"}),
+            Box::new(move |r| {
+                tx.send(r).ok();
+            }),
+        );
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("handler ran")
+            .expect("handler returned Ok");
+        // notifier was called…
+        assert_eq!(notifier.captured.lock().unwrap().len(), 1);
+        // …but completion event did NOT fan out. Sleep a beat in case
+        // the bus tx is asynchronous, then assert no event arrived.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            matches!(
+                completed_rx.recv_timeout(Duration::from_millis(50)),
+                nestty_core::event_bus::RecvOutcome::Timeout
+            ),
+            "silent action must not publish .completed"
+        );
     }
 }

@@ -674,7 +674,7 @@ Nothing in the daemon should be GUI-reachable but not CLI-reachable.
 
 ## Cross-cutting needs
 
-- **`notify.show` action** — backed by `Notifier`. Unblocks Option A toasts. ~half day per platform.
+- **`notify.show` action** — backed by `Notifier`. **Shipped** in decisions.md #38. Subprocess on both platforms (`notify-send` Linux, `osascript -e 'on run argv'` macOS — argv-passed to avoid AppleScript injection). Registered `blocking_silent` on both daemon and GUI in-process registries so the trigger pump never stalls and `.completed` doesn't fan-out. zbus / direct D-Bus deferred unless burst rates from life-assistant Option H prove the subprocess cost matters.
 - **`event.history` action** — in-memory ring buffer of last N events, read-only. ~half day. Used by Option D + B.
 - **Service install** — install scripts ship the unit/plist. ~half day each.
 - **Privileged-action audit** — list every action that warrants

@@ -209,6 +209,52 @@ impl NesttyWindow {
                 Ok(json!({ "events": arr }))
             });
         }
+        // `notify.show` — mirror of the daemon-side registration so
+        // the GUI's in-process trigger engine reaches the same action
+        // when `host_triggers = OFF`. Blocking-silent: subprocess off
+        // the dispatch thread, no `.completed` spam.
+        {
+            let notifier = nestty_core::notifier::platform_notifier();
+            actions.register_blocking_silent("notify.show", move |params| {
+                let title = match params.get("title").and_then(|v| v.as_str()) {
+                    Some(s) if !s.is_empty() => s.to_string(),
+                    _ => {
+                        return Err(invalid_params(
+                            "notify.show requires non-empty `title` string",
+                        ));
+                    }
+                };
+                let body = match params.get("body") {
+                    Some(v) if v.is_null() => String::new(),
+                    None => String::new(),
+                    Some(v) => match v.as_str() {
+                        Some(s) => s.to_string(),
+                        None => {
+                            return Err(invalid_params("notify.show `body` must be a string"));
+                        }
+                    },
+                };
+                let level: nestty_core::notifier::Level = match params.get("level") {
+                    None | Some(serde_json::Value::Null) => nestty_core::notifier::Level::default(),
+                    Some(v) => serde_json::from_value(v.clone()).map_err(|_| {
+                        invalid_params("notify.show `level` must be one of `info`, `warn`, `error`")
+                    })?,
+                };
+                match &notifier {
+                    Some(n) => match n.notify(&title, &body, level) {
+                        Ok(()) => Ok(json!({ "shown": true })),
+                        Err(e) => {
+                            log::warn!("notify.show failed: {e}");
+                            Err(internal_error(format!("notify subprocess: {e}")))
+                        }
+                    },
+                    None => {
+                        log::debug!("notify.show: no Notifier for this platform; dropping");
+                        Ok(json!({ "shown": false, "reason": "no_notifier" }))
+                    }
+                }
+            });
+        }
 
         // Dispatch channel: TabManager owns the original sender (used by
         // plugin JS bridges). Trigger sink gets a clone so trigger-fired

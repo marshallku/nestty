@@ -711,13 +711,13 @@ Track lives in `docs/harness-integration.md`. Sequenced 1–16. Pending the heav
 - [x] **Step 5** — `socket.rs` split into daemon-owned + GUI-owned dispatch; dual-dispatch behind feature flag.
 - [x] **Step 6** — Daemon-attached default; `--standalone` retained.
 - [x] **Step 8 (partial)** — `event.history` ring buffer + `nestctl recent` (decisions.md #35), `events.publish` socket surface + `nestctl event publish` (existing).
-- [x] **Step 9 (this slice)** — Trust boundary: `event_bus::Origin` field + `[security] { accept_external, allow_privileged }` trigger schema + `is_privileged_action(system.spawn)` engine-level gate + `nestctl event publish --quiet`. Daemon-side coverage only — bridge wire propagation, causal taint, macOS FFI, registry-marked privileged actions tracked as known gaps. See decisions.md #37.
+- [x] **Step 9** — Trust boundary: `event_bus::Origin` field + `[security] { accept_external, allow_privileged }` trigger schema + `is_privileged_action(system.spawn)` engine-level gate + `nestctl event publish --quiet`. Daemon-side coverage only — bridge wire propagation, causal taint, macOS FFI, registry-marked privileged actions tracked as known gaps. See decisions.md #37.
+- [x] **Step 8 remainder (this slice)** — `notify.show` action via `Notifier` trait. Subprocess-backed (`notify-send` Linux, `osascript -e 'on run argv'` macOS). Registered `blocking_silent` on both daemon and GUI in-process registries. See decisions.md #38.
 
 **Outstanding (in sequencing order):**
 
 - [ ] **Step 3** — Phase 9.4 bounded thread pool (already in tree; verify no `try_dispatch` paths still spawn unbounded).
 - [ ] **Step 7** — `nestty-daemon.service` systemd unit + macOS `launchd` plist + `--with-daemon` flag on install scripts.
-- [ ] **Step 8 remainder** — `notify.show` action backed by `Notifier` trait (libnotify on Linux, `osascript` on macOS).
 - [ ] **Step 10 — Option A (`claude` plugin)** — Hook scripts publish `claude.tool_used`, `claude.commit_blocked`, `claude.review_approved`, `claude.session_stopped`; plugin exposes `claude.session_state`, `claude.list_dirty`, `claude.last_handoff`, `claude.list_sessions`. Unblocked by step 9.
 - [ ] **Step 11 — Option I (cron triggers)** — `tokio-cron-scheduler` (or hand-rolled with `chrono-tz`) + `[[triggers]]` TOML cron field + missed-run policy + dedupe on config reload + per-trigger named `time.<trigger_name>` events.
 - [ ] **Step 12 — Option H (life-assistant bridge)** — `lifeassistant` plugin + ~30 LOC patch to life-assistant scheduler pushing `nestctl event publish lifeassistant.job_completed` (External origin; consumed by triggers with `accept_external = true`).
